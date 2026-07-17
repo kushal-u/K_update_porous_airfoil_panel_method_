@@ -284,7 +284,6 @@ Responsible for streamline visualisation:
 - direction arrows;
 - pore and seed-location CSV files.
 
-The internal streamline corridor is a post-processing visualisation. It is not a fully resolved internal CFD model.
 
 ### `porous_airfoil/plotting/common.py`
 
