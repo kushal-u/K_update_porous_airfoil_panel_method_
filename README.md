@@ -85,26 +85,6 @@ Normal user settings are stored in:
 ```text
 porous_airfoil/config.py
 ```
-
-Important settings include:
-
-- `RUN_MODE`
-- `SELECTED_MODEL`
-- `AIRFOIL_NAME`
-- `CHORD`
-- `N_PANELS`
-- `REYNOLDS_EXTERNAL`
-- `AOA_DEG`
-- `PORE_DIAMETER`
-- `FIXED_AOA_PORE_DIAMETERS`
-- `AOA_SWEEP_START_DEG`
-- `AOA_SWEEP_END_DEG`
-- `AOA_SWEEP_STEP_DEG`
-- `AOA_SWEEP_PORE_DIAMETERS`
-- coupling tolerances and relaxation;
-- contour-grid resolution;
-- XFOIL and ParaView switches.
-
 The default results folder is:
 
 ```text
