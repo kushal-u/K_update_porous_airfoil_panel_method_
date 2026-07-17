@@ -8,7 +8,7 @@ The project supports:
 - angle-of-attack sweeps;
 - XFOIL comparison;
 - pressure, velocity and pressure-coefficient contours;
-- journal-quality lift and pitching-moment figures;
+- lift and pitching-moment figures;
 - porous-network geometry figures;
 - external and approximate internal-channel streamline visualisation;
 - optional ParaView export.
