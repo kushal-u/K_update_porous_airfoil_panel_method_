@@ -1,0 +1,379 @@
+"""Application workflows for the porous-airfoil study.
+
+This is the orchestration layer. It coordinates the numerical core, external
+integrations, and plotting modules without placing application entry-point code
+inside the solver modules.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+
+from .config import (
+    AIRFOIL_NAME,
+    AOA_DEG,
+    AOA_SWEEP_END_DEG,
+    AOA_SWEEP_PORE_DIAMETERS,
+    AOA_SWEEP_START_DEG,
+    AOA_SWEEP_STEP_DEG,
+    CHORD,
+    CONTOUR_NX,
+    CONTOUR_NY,
+    COUPLING,
+    EXPORT_AOA_SWEEP_PARAVIEW,
+    EXPORT_PARAVIEW,
+    FIXED_AOA_PORE_DIAMETERS,
+    GeometryLimits,
+    MAKE_CONTOUR_PLOTS,
+    MAKE_FIXED_AOA_DIAMETER_OUTPUTS,
+    MAKE_ZOOMED_CONTOUR_PLOTS,
+    MU_INF,
+    N_PANELS,
+    OUTPUT_ROOT,
+    P_INF,
+    PORE_DIAMETER,
+    REYNOLDS_EXTERNAL,
+    RHO_INF,
+    RUN_MODE,
+    SELECTED_MODEL,
+    USE_XFOIL,
+    XFOIL_OUTPUT_ROOT,
+    ZOOMED_CONTOUR_XLIM,
+    ZOOMED_CONTOUR_YLIM,
+    PorousModelSpec,
+)
+from .integrations.paraview import export_solid_reference_paraview_files
+from .plotting.aerodynamic import plot_aoa_sweep_comparison
+from .porous import (
+    add_xfoil_to_sweep_comparison,
+    build_base_problem,
+    build_model_specs,
+    representative_pore_diameter,
+    run_one_model,
+    run_porous_aoa_sweep_for_model,
+    run_xfoil_aoa_sweep_for_case,
+)
+
+VALID_MODEL_NAMES = {
+    "all",
+    "model_1_4_chordwise",
+    "model_2_9_perpendicular",
+    "model_3_combined_independent",
+    "model_4_saved_case_1",
+}
+
+VALID_RUN_MODES = {
+    "fixed",
+    "aoa_sweep",
+    "contours",
+    "streamlines",
+    "geometry",
+    "aero_plots",
+}
+
+
+def select_models(models: list[PorousModelSpec]) -> list[PorousModelSpec]:
+    """Return the model list requested by ``config.SELECTED_MODEL``."""
+    if SELECTED_MODEL not in VALID_MODEL_NAMES:
+        raise ValueError(
+            f"Invalid SELECTED_MODEL={SELECTED_MODEL!r}. "
+            f"Choose one of: {sorted(VALID_MODEL_NAMES)}"
+        )
+    if SELECTED_MODEL == "all":
+        return models
+
+    selected = [model for model in models if model.name == SELECTED_MODEL]
+    if not selected:
+        available = [model.name for model in models]
+        raise RuntimeError(
+            f"No model matched SELECTED_MODEL={SELECTED_MODEL!r}. "
+            f"Available models: {available}"
+        )
+    return selected
+
+
+def _unique_diameters(values: tuple[float, ...]) -> tuple[float, ...]:
+    """Return unique diameters while retaining their configured order."""
+    unique: list[float] = []
+    for value in values:
+        diameter = float(value)
+        if not any(abs(diameter - old) <= 1.0e-15 for old in unique):
+            unique.append(diameter)
+    return tuple(unique)
+
+
+def _diameter_label(diameter_m: float) -> str:
+    return f"D_{1000.0 * float(diameter_m):.2f}mm".replace(".", "p")
+
+
+def _build_model_by_name(geom, model_name: str, diameter_m: float) -> PorousModelSpec:
+    matches = [
+        model
+        for model in build_model_specs(geom=geom, diameter_m=float(diameter_m))
+        if model.name == model_name
+    ]
+    if not matches:
+        raise RuntimeError(
+            f"Could not build {model_name!r} for diameter {diameter_m:.6e} m."
+        )
+    return matches[0]
+
+
+def run_fixed_cases() -> pd.DataFrame:
+    """Run configured fixed-angle porous-airfoil cases once per diameter."""
+    n_panels = int(N_PANELS)
+    contour_nx = int(CONTOUR_NX)
+    contour_ny = int(CONTOUR_NY)
+    output_root = Path(OUTPUT_ROOT)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 80)
+    print("RUNNING FIXED POROUS MODELS — PANEL METHOD + XFOIL")
+    print("=" * 80)
+    print(f"Airfoil                    : NACA {AIRFOIL_NAME}")
+    print(f"AoA [deg]                  : {AOA_DEG}")
+    print(f"Reynolds number            : {REYNOLDS_EXTERNAL:.6e}")
+    print(f"Panels                     : {n_panels}")
+    print(f"Selected model             : {SELECTED_MODEL}")
+    print(f"Output root                : {output_root}")
+    print(f"XFOIL output root          : {XFOIL_OUTPUT_ROOT}")
+    print(f"Contour plots              : {bool(MAKE_CONTOUR_PLOTS)}")
+    print(f"Contour grid               : {contour_nx} x {contour_ny}")
+    print(f"Fixed-AoA ParaView         : {EXPORT_PARAVIEW}")
+    print(f"XFOIL enabled              : {USE_XFOIL}")
+
+    flow, geom, _, aero_solver = build_base_problem(
+        airfoil_name=AIRFOIL_NAME,
+        chord=CHORD,
+        n_panels=n_panels,
+        aoa_deg=AOA_DEG,
+        reynolds_external=REYNOLDS_EXTERNAL,
+        rho_inf=RHO_INF,
+        mu_inf=MU_INF,
+        p_inf=P_INF,
+    )
+
+    print(f"Freestream speed [m/s]     : {flow.v_inf:.8f}")
+    print("[Setup] Solving solid-airfoil baseline...")
+    solid_result = aero_solver.solve()
+    print(f"[Setup] Solid CL            : {solid_result.CL:.8f}")
+    print(f"[Setup] Solid CD            : {solid_result.CD:.8e}")
+    print(f"[Setup] Solid CM            : {solid_result.CM:.8f}")
+
+    if EXPORT_PARAVIEW:
+        export_solid_reference_paraview_files(
+            output_root=output_root,
+            geom=geom,
+            aero_solver=aero_solver,
+            solid_result=solid_result,
+            field_nx=contour_nx,
+            field_ny=contour_ny,
+        )
+    else:
+        print("[ParaView] Fixed-AoA ParaView export disabled.")
+
+    selected = select_models(
+        build_model_specs(geom=geom, diameter_m=float(PORE_DIAMETER))
+    )
+
+    diameters = (
+        _unique_diameters(tuple(float(value) for value in FIXED_AOA_PORE_DIAMETERS))
+        if MAKE_FIXED_AOA_DIAMETER_OUTPUTS
+        else (float(PORE_DIAMETER),)
+    )
+    if not diameters:
+        diameters = (float(PORE_DIAMETER),)
+
+    rows: list[dict] = []
+    for base_model in selected:
+        for diameter_m in diameters:
+            model = _build_model_by_name(
+                geom=geom,
+                model_name=base_model.name,
+                diameter_m=diameter_m,
+            )
+            row = run_one_model(
+                model=model,
+                geom=geom,
+                flow=flow,
+                aero_solver=aero_solver,
+                solid_result=solid_result,
+                output_root=output_root,
+                make_contours=bool(MAKE_CONTOUR_PLOTS),
+                contour_nx=contour_nx,
+                contour_ny=contour_ny,
+                export_paraview=bool(EXPORT_PARAVIEW),
+                make_zoomed_contours=bool(MAKE_ZOOMED_CONTOUR_PLOTS),
+                zoomed_xlim=ZOOMED_CONTOUR_XLIM,
+                zoomed_ylim=ZOOMED_CONTOUR_YLIM,
+                run_aoa_sweep=False,
+                output_name=f"{base_model.name}_{_diameter_label(diameter_m)}",
+            )
+            rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    combined_path = output_root / "all_models_summary.csv"
+    summary.to_csv(combined_path, index=False)
+    print(f"[CSV Saved] {combined_path}")
+    print("=" * 80)
+    print("DONE")
+    print("=" * 80)
+    return summary
+
+
+def run_sweep_for_model(
+    base_model: PorousModelSpec,
+    geom,
+    output_root: Path,
+) -> pd.DataFrame:
+    """Run all configured diameters for one selected model."""
+    model_dir = output_root / "aoa_sweep" / base_model.name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    diameters = _unique_diameters(
+        tuple(float(value) for value in AOA_SWEEP_PORE_DIAMETERS)
+    )
+    if not diameters:
+        diameters = (float(PORE_DIAMETER),)
+
+    print()
+    print("=" * 80)
+    print(f"RUNNING AOA SWEEP FOR {base_model.name}")
+    print("=" * 80)
+    print(base_model.description)
+    print(
+        "AoA range [deg]            : "
+        f"{AOA_SWEEP_START_DEG:g} to {AOA_SWEEP_END_DEG:g} "
+        f"step {AOA_SWEEP_STEP_DEG:g}"
+    )
+    print("Sweep diameters [m]        : " + ", ".join(f"{value:.6e}" for value in diameters))
+    print(f"Output folder              : {model_dir}")
+
+    frames: list[pd.DataFrame] = []
+    paraview_reference_diameter = diameters[0]
+
+    for diameter_m in diameters:
+        model = _build_model_by_name(geom, base_model.name, diameter_m)
+        print(
+            f"[Sweep] {model.name}, "
+            f"pore diameter = {representative_pore_diameter(model):.6e} m"
+        )
+        export_this = (
+            bool(EXPORT_AOA_SWEEP_PARAVIEW)
+            and abs(diameter_m - paraview_reference_diameter) <= 1.0e-15
+        )
+        frame = run_porous_aoa_sweep_for_model(
+            model=model,
+            airfoil_name=AIRFOIL_NAME,
+            chord=CHORD,
+            n_panels=int(N_PANELS),
+            rho_inf=RHO_INF,
+            mu_inf=MU_INF,
+            p_inf=P_INF,
+            reynolds_external=REYNOLDS_EXTERNAL,
+            coupling=COUPLING,
+            limits=GeometryLimits(),
+            alpha_start=AOA_SWEEP_START_DEG,
+            alpha_end=AOA_SWEEP_END_DEG,
+            alpha_step=AOA_SWEEP_STEP_DEG,
+            export_paraview=export_this,
+            paraview_output_dir=(
+                model_dir / "aoa_sweep_paraview" / _diameter_label(diameter_m)
+            ),
+            field_nx=int(CONTOUR_NX),
+            field_ny=int(CONTOUR_NY),
+        )
+        frames.append(frame)
+
+    sweep_df = pd.concat(frames, ignore_index=True)
+    xfoil_sweep = run_xfoil_aoa_sweep_for_case(
+        airfoil_name=AIRFOIL_NAME,
+        output_dir=Path(XFOIL_OUTPUT_ROOT) / "aoa_sweep" / base_model.name,
+        alpha_start=AOA_SWEEP_START_DEG,
+        alpha_end=AOA_SWEEP_END_DEG,
+        alpha_step=AOA_SWEEP_STEP_DEG,
+    )
+    if xfoil_sweep is not None:
+        sweep_df = add_xfoil_to_sweep_comparison(sweep_df, xfoil_sweep)
+
+    csv_path = model_dir / "aoa_sweep_comparison.csv"
+    sweep_df.to_csv(csv_path, index=False)
+    print(f"[CSV Saved] {csv_path}")
+    plot_aoa_sweep_comparison(sweep_df=sweep_df, output_dir=model_dir)
+    return sweep_df
+
+
+def run_aoa_sweep() -> pd.DataFrame:
+    """Run the configured angle-of-attack sweep."""
+    output_root = Path(OUTPUT_ROOT)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 80)
+    print("RUNNING SELECTED-MODEL AOA SWEEP — PANEL METHOD + XFOIL")
+    print("=" * 80)
+    print(f"Airfoil                    : NACA {AIRFOIL_NAME}")
+    print(f"Reynolds number            : {REYNOLDS_EXTERNAL:.6e}")
+    print(f"Panels                     : {int(N_PANELS)}")
+    print(f"Selected model             : {SELECTED_MODEL}")
+    print(f"AoA-sweep ParaView         : {EXPORT_AOA_SWEEP_PARAVIEW}")
+
+    flow, geom, _, _ = build_base_problem(
+        airfoil_name=AIRFOIL_NAME,
+        chord=CHORD,
+        n_panels=int(N_PANELS),
+        aoa_deg=0.0,
+        reynolds_external=REYNOLDS_EXTERNAL,
+        rho_inf=RHO_INF,
+        mu_inf=MU_INF,
+        p_inf=P_INF,
+    )
+    print(f"Freestream speed [m/s]     : {flow.v_inf:.8f}")
+
+    selected = select_models(
+        build_model_specs(geom=geom, diameter_m=float(PORE_DIAMETER))
+    )
+    frames: list[pd.DataFrame] = []
+    for base_model in selected:
+        frame = run_sweep_for_model(base_model, geom, output_root)
+        frame.insert(0, "model_name", base_model.name)
+        frames.append(frame)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined_path = output_root / "aoa_sweep" / "selected_models_aoa_sweep_summary.csv"
+    combined_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(combined_path, index=False)
+    print(f"[CSV Saved] {combined_path}")
+    print("=" * 80)
+    print("AOA SWEEP DONE")
+    print("=" * 80)
+    return combined
+
+
+def run_selected_workflow(run_mode: str | None = None):
+    """Dispatch the configured workflow from the single project entry point."""
+    mode = str(run_mode or RUN_MODE).strip().lower()
+    if mode not in VALID_RUN_MODES:
+        raise ValueError(
+            f"Invalid RUN_MODE={mode!r}. Choose one of: {sorted(VALID_RUN_MODES)}"
+        )
+
+    if mode == "fixed":
+        return run_fixed_cases()
+    if mode == "aoa_sweep":
+        return run_aoa_sweep()
+    if mode == "contours":
+        from .plotting.contours import main
+        return main()
+    if mode == "streamlines":
+        from .plotting.streamlines import main
+        return main()
+    if mode == "geometry":
+        from .plotting.geometry import main
+        return main()
+    if mode == "aero_plots":
+        from .plotting.aerodynamic import main
+        return main()
+
+    raise AssertionError(f"Unhandled run mode: {mode}")
