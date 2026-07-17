@@ -193,11 +193,6 @@ model_4_saved_case_1
 
 These identifiers are retained to remain compatible with existing folders, CSV files and plotting logic. Publication labels are normally shown as Horizontal, Vertical and Horizontal + Vertical.
 
-## Notes on streamline figures
-
-The external streamlines are integrated from the panel-method velocity field.
-
-The internal-channel streamline representation uses the solved passage flow rate and an approximate channel velocity corridor. It is intended for flow-direction visualisation. 
 
 ## Licence
 
