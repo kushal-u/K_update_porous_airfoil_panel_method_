@@ -134,9 +134,9 @@ The equivalent package command is:
 python3 -m porous_airfoil
 ```
 
-## Running all plotting workflows
+## Running All Workflows
 
-When new AoA-sweep data is required:
+From the project root, run:
 
 ```bash
 POROUS_RUN_MODE=aoa_sweep python3 run.py &&
@@ -146,14 +146,22 @@ POROUS_RUN_MODE=contours python3 run.py &&
 POROUS_RUN_MODE=streamlines python3 run.py
 ```
 
-When valid AoA-sweep CSV files already exist:
+This runs the complete results and plotting pipeline in sequence:
 
-```bash
-POROUS_RUN_MODE=aero_plots python3 run.py &&
-POROUS_RUN_MODE=geometry python3 run.py &&
-POROUS_RUN_MODE=contours python3 run.py &&
-POROUS_RUN_MODE=streamlines python3 run.py
+1. AoA sweep
+2. Journal CL and CM plots
+3. Porous-airfoil geometry figures
+4. Difference contour figures
+5. Streamline figures
+
+All generated files are saved in:
+
+```text
+outputs/
 ```
+
+The next workflow starts only when the previous workflow finishes successfully.
+
 
 ## Output structure
 
