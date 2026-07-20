@@ -3,11 +3,9 @@ solver.py
 
 Core aerodynamic solver and geometry utilities.
 
-This file provides:
-- flow, airfoil, reference, and coupling configuration dataclasses
-- NACA 4-digit airfoil generation
-- panel-geometry construction
-- a source-vortex panel method solver
+The solver supports both impermeable panels and partially open/transpiring
+panels.  Porous geometry remains outside this module: callers provide the
+normal velocity and solid-wall fraction associated with every panel.
 """
 
 from __future__ import annotations
@@ -561,7 +559,14 @@ def compute_IJKL_vectorized(geom: PanelGeometry) -> tuple[np.ndarray, np.ndarray
 
 @dataclass
 class SPVPResult:
-    """Aerodynamic result from the source-vortex panel method."""
+    """Aerodynamic result from the source-vortex panel method.
+
+    ``Cx``, ``Cy``, ``CL``, ``CD`` and ``CM`` are the total values returned
+    to downstream workflows.  A standalone panel solve has no internal force,
+    so the total and external-wall values are identical.  The porous coupling
+    layer may later add internal-channel forces while preserving the external
+    contribution in the dedicated fields below.
+    """
 
     lambda_src: np.ndarray
     gamma: float
@@ -577,6 +582,31 @@ class SPVPResult:
     system_residual_norm: float
     kutta_residual: float
     normal_bc_residual_max: float
+
+    # Boundary data used for this solve.
+    normal_velocity: np.ndarray
+    normal_velocity_mean_square: np.ndarray
+    wall_fraction: np.ndarray
+    boundary_flux_per_unit_span_m2_s: float
+
+    # Decomposed force and moment coefficients.
+    external_wall_Cx: float
+    external_wall_Cy: float
+    external_wall_CL: float
+    external_wall_CD: float
+    external_wall_CM: float
+
+    internal_channel_Cx: float = 0.0
+    internal_channel_Cy: float = 0.0
+    internal_channel_CL: float = 0.0
+    internal_channel_CD: float = 0.0
+    internal_channel_CM: float = 0.0
+
+    total_Cx: float = 0.0
+    total_Cy: float = 0.0
+    total_CL: float = 0.0
+    total_CD: float = 0.0
+    total_CM: float = 0.0
 
 
 class SourceVortexPanelMethod:
@@ -618,8 +648,34 @@ class SourceVortexPanelMethod:
         b[N] = -2.0 * np.pi * Vinf * (self.geom.sin_beta[0] + self.geom.sin_beta[-1])
         return b
 
-    def solve(self, normal_transpiration: np.ndarray | None = None) -> SPVPResult:
-        """Solve the aerodynamic problem."""
+    def solve(
+        self,
+        normal_transpiration: np.ndarray | None = None,
+        wall_fraction: np.ndarray | None = None,
+        normal_velocity_mean_square: np.ndarray | None = None,
+    ) -> SPVPResult:
+        """Solve the aerodynamic problem.
+
+        Parameters
+        ----------
+        normal_transpiration
+            Panel-averaged outward normal velocity.  Positive values represent
+            flow leaving the airfoil and negative values represent inflow.
+        wall_fraction
+            Fraction of each panel that remains a pressure-bearing solid wall.
+            A value of one is a conventional solid panel; zero is a fully open
+            panel.  Fractional values support openings that terminate inside a
+            panel without remeshing the complete airfoil boundary.
+
+        Notes
+        -----
+        At a transpiring opening the Bernoulli speed contains both tangential
+        and prescribed normal components, so
+
+            Cp = 1 - (Vt**2 + Vn**2) / Vinf**2.
+
+        Pressure force is integrated only over the solid-wall fraction.
+        """
         N = self.geom.num_pan
         Vinf = self.flow.v_inf
         c = self.geom.chord
@@ -629,59 +685,112 @@ class SourceVortexPanelMethod:
         if c <= 0.0:
             raise ValueError("Reference chord must be positive.")
 
-        b = self._build_rhs(normal_transpiration=normal_transpiration)
+        vn = (
+            np.zeros(N, dtype=float)
+            if normal_transpiration is None
+            else np.asarray(normal_transpiration, dtype=float)
+        )
+        if vn.shape != (N,):
+            raise ValueError(f"normal_transpiration must have shape ({N},).")
+        if not np.all(np.isfinite(vn)):
+            raise ValueError("normal_transpiration contains non-finite values.")
+
+        vn_mean_square = (
+            vn**2
+            if normal_velocity_mean_square is None
+            else np.asarray(normal_velocity_mean_square, dtype=float)
+        )
+        if vn_mean_square.shape != (N,):
+            raise ValueError(
+                f"normal_velocity_mean_square must have shape ({N},)."
+            )
+        if not np.all(np.isfinite(vn_mean_square)) or np.any(vn_mean_square < 0.0):
+            raise ValueError(
+                "normal_velocity_mean_square must contain finite non-negative values."
+            )
+
+        wall = (
+            np.ones(N, dtype=float)
+            if wall_fraction is None
+            else np.asarray(wall_fraction, dtype=float)
+        )
+        if wall.shape != (N,):
+            raise ValueError(f"wall_fraction must have shape ({N},).")
+        if not np.all(np.isfinite(wall)):
+            raise ValueError("wall_fraction contains non-finite values.")
+        if np.any((wall < -1.0e-12) | (wall > 1.0 + 1.0e-12)):
+            raise ValueError("wall_fraction values must lie in [0, 1].")
+        wall = np.clip(wall, 0.0, 1.0)
+
+        b = self._build_rhs(normal_transpiration=vn)
         x = la.lu_solve((self.lu_A, self.piv_A), b)
 
         lam = x[:-1]
-        gamma = x[-1]
+        gamma = float(x[-1])
 
-        Vt = np.zeros(N)
-        Cp = np.zeros(N)
+        Vt = (
+            Vinf * self.geom.sin_beta
+            + (self.J @ lam) / (2.0 * np.pi)
+            + gamma / 2.0
+            - gamma * np.sum(self.L, axis=1) / (2.0 * np.pi)
+        )
 
-        for i in range(N):
-            Vt[i] = (
-                Vinf * self.geom.sin_beta[i]
-                + (1.0 / (2.0 * np.pi)) * np.sum(lam * self.J[i, :])
-                + gamma / 2.0
-                - (gamma / (2.0 * np.pi)) * np.sum(self.L[i, :])
-            )
-            Cp[i] = 1.0 - (Vt[i] / Vinf) ** 2
+        Cp = 1.0 - (Vt**2 + vn_mean_square) / Vinf**2
 
-        dCx = -Cp * self.geom.nx * self.geom.S / c
-        dCy = -Cp * self.geom.ny * self.geom.S / c
+        dCx = -Cp * self.geom.nx * self.geom.S * wall / c
+        dCy = -Cp * self.geom.ny * self.geom.S * wall / c
 
-        Cx = float(np.sum(dCx))
-        Cy = float(np.sum(dCy))
+        external_Cx = float(np.sum(dCx))
+        external_Cy = float(np.sum(dCy))
 
         alpha = np.deg2rad(self.flow.aoa_deg)
-        CL = Cy * np.cos(alpha) - Cx * np.sin(alpha)
-        CD = Cx * np.cos(alpha) + Cy * np.sin(alpha)
+        external_CL = float(
+            external_Cy * np.cos(alpha) - external_Cx * np.sin(alpha)
+        )
+        external_CD = float(
+            external_Cx * np.cos(alpha) + external_Cy * np.sin(alpha)
+        )
 
         xbar = self.geom.XC - self.ref.x_ref
         ybar = self.geom.YC - self.ref.y_ref
         dCM = -(xbar * dCy - ybar * dCx) / c
-        CM = float(np.sum(dCM))
+        external_CM = float(np.sum(dCM))
 
         circulation = gamma * np.sum(self.geom.S)
         CL_kj = float(2.0 * circulation / (Vinf * c))
 
         system_residual = self.A @ x - b
+        boundary_flux = float(np.sum(vn * self.geom.S))
 
         return SPVPResult(
             lambda_src=lam,
-            gamma=float(gamma),
-            Vt=Vt,
-            Cp=Cp,
-            Cx=Cx,
-            Cy=Cy,
-            CL=float(CL),
-            CD=float(CD),
-            CM=float(CM),
+            gamma=gamma,
+            Vt=np.asarray(Vt, dtype=float),
+            Cp=np.asarray(Cp, dtype=float),
+            Cx=external_Cx,
+            Cy=external_Cy,
+            CL=external_CL,
+            CD=external_CD,
+            CM=external_CM,
             CL_kj=CL_kj,
             source_sum=float(np.sum(lam * self.geom.S)),
             system_residual_norm=float(np.linalg.norm(system_residual)),
             kutta_residual=float(system_residual[-1]),
             normal_bc_residual_max=float(np.max(np.abs(system_residual[:-1]))),
+            normal_velocity=vn.copy(),
+            normal_velocity_mean_square=vn_mean_square.copy(),
+            wall_fraction=wall.copy(),
+            boundary_flux_per_unit_span_m2_s=boundary_flux,
+            external_wall_Cx=external_Cx,
+            external_wall_Cy=external_Cy,
+            external_wall_CL=external_CL,
+            external_wall_CD=external_CD,
+            external_wall_CM=external_CM,
+            total_Cx=external_Cx,
+            total_Cy=external_Cy,
+            total_CL=external_CL,
+            total_CD=external_CD,
+            total_CM=external_CM,
         )
 
     def panel_pressures(self, result: SPVPResult) -> np.ndarray:
