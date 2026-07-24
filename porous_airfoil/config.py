@@ -1,7 +1,7 @@
 """User-editable configuration and lightweight data containers.
 
 Edit this file to change the airfoil, Reynolds number, selected porous model,
-pore diameter, coupling tolerances, plotting resolution, and XFOIL settings.
+rectangular channel height, coupling iteration limit, plotting resolution, and XFOIL settings.
 The numerical implementation lives in solver.py and porous_core.py.
 """
 
@@ -131,10 +131,6 @@ XFOIL_OUTPUT_ROOT = Path(
     os.getenv("XFOIL_OUTPUT_ROOT", str(OUTPUT_ROOT / "_xfoil"))
 ).expanduser()
 
-# Select the workflow launched by the root ``run.py``.
-# Valid values: fixed, aoa_sweep, contours, streamlines, geometry, aero_plots.
-RUN_MODE = os.getenv("POROUS_RUN_MODE", "fixed").strip().lower()
-# RUN_MODE  = "contours"
 # Choose which porous model to run.
 # Valid values:
 #   "all"
@@ -158,22 +154,53 @@ RHO_INF = 1.225
 MU_INF = 1.8e-5
 P_INF = 101325.0
 
-# Porous-channel dimensions.
+# Two-dimensional rectangular porous-channel dimensions.
+#
+# Each internal channel is an in-plane rectangle with:
+#     L : distance between the two pore centres
+#     H : channel opening measured normal to the channel centreline
+#
+# The hydraulic equations are written per unit span:
+#     q_prime [m^2/s] = flow rate per unit span
+#     A_prime [m]     = H
+#     U_bar [m/s]     = q_prime / H
+#     D_h [m]         = 2 H
+#     R_prime         = 12 mu L / H^3       (laminar parallel-wall limit)
+#
+# The visible in-plane channel area is L*H, but L*H is parallel to the flow and
+# is therefore not used as the flow-through area.
+#
+# SPAN_WIDTH is retained only for backward-compatible function calls and old
+# output readers. It is not used by the active 2D hydraulic or transpiration
+# equations.
 SPAN_WIDTH = 0.02
-PORE_DIAMETER = 0.0170
-DEFAULT_PORE_DIAMETER = PORE_DIAMETER
+CHANNEL_HEIGHT = 0.0170
+DEFAULT_CHANNEL_HEIGHT = CHANNEL_HEIGHT
+
+# Compatibility aliases. There is no independent hydraulic width in the 2D
+# per-unit-span model.
+CHANNEL_WIDTH = 1.0
+DEFAULT_CHANNEL_WIDTH = 1.0
+
+# Backward-compatible aliases. They now mean rectangular channel height H.
+PORE_DIAMETER = CHANNEL_HEIGHT
+DEFAULT_PORE_DIAMETER = DEFAULT_CHANNEL_HEIGHT
 
 # =============================================================================
-# FIXED-AOA DIAMETER CASES
+# FIXED-AOA RECTANGULAR-CHANNEL HEIGHT CASES
 # =============================================================================
-# These are additional fixed-AoA cases. Each diameter gets its own output folder.
-MAKE_FIXED_AOA_DIAMETER_OUTPUTS = True
+# These are additional fixed-AoA cases. Each channel height gets its own output folder.
+MAKE_FIXED_AOA_CHANNEL_HEIGHT_OUTPUTS = True
 
-FIXED_AOA_PORE_DIAMETERS = (
+FIXED_AOA_CHANNEL_HEIGHTS = (
     0.0080,
     0.0090,
     0.0100,
 )
+
+# Backward-compatible aliases.
+MAKE_FIXED_AOA_DIAMETER_OUTPUTS = MAKE_FIXED_AOA_CHANNEL_HEIGHT_OUTPUTS
+FIXED_AOA_PORE_DIAMETERS = FIXED_AOA_CHANNEL_HEIGHTS
 
 # =============================================================================
 # AOA SWEEP SETTINGS
@@ -182,20 +209,20 @@ AOA_SWEEP_START_DEG = -5.0
 AOA_SWEEP_END_DEG = 15.0
 AOA_SWEEP_STEP_DEG = 1.0
 
-AOA_SWEEP_PORE_DIAMETERS = (
+AOA_SWEEP_CHANNEL_HEIGHTS = (
     0.0080,
     0.0090,
     0.0100,
 )
+
+# Backward-compatible alias.
+AOA_SWEEP_PORE_DIAMETERS = AOA_SWEEP_CHANNEL_HEIGHTS
 
 # =============================================================================
 # COUPLING SETTINGS
 # =============================================================================
 COUPLING = CouplingConfig(
     max_iter=500,
-    tol_vn=1e-6,
-    tol_q=1e-8,
-    relaxation=0.5,
 )
 
 # =============================================================================
@@ -247,7 +274,7 @@ class GeometryLimits:
 class Pore:
     x_frac: float
     side: str
-    diameter: float
+    height: float
 
     def __post_init__(self) -> None:
         side = self.side.lower()
@@ -257,20 +284,63 @@ class Pore:
             raise ValueError("Pore side must be 'upper' or 'lower'.")
         if not (0.0 <= self.x_frac <= 1.0):
             raise ValueError("x_frac must be in [0, 1].")
-        if self.diameter <= 0.0:
-            raise ValueError("Pore diameter must be positive.")
+        if self.height <= 0.0:
+            raise ValueError("Rectangular pore height must be positive.")
+
+    @property
+    def area(self) -> float:
+        """Flow area per unit span, A' = H [m]."""
+        return float(self.height)
+
+    @property
+    def hydraulic_diameter(self) -> float:
+        """Parallel-wall hydraulic diameter, D_h = 2H."""
+        return float(2.0 * self.height)
+
+    @property
+    def diameter(self) -> float:
+        """Backward-compatible alias returning channel height H."""
+        return float(self.height)
 
 
 @dataclass(frozen=True)
 class Chamber:
-    hydraulic_diameter: float
-    area: float
+    height: float
 
     def __post_init__(self) -> None:
-        if self.hydraulic_diameter <= 0.0:
-            raise ValueError("hydraulic_diameter must be positive.")
-        if self.area <= 0.0:
-            raise ValueError("area must be positive.")
+        if self.height <= 0.0:
+            raise ValueError("Rectangular channel height must be positive.")
+
+    @property
+    def area(self) -> float:
+        """Flow area per unit span, A' = H [m]."""
+        return float(self.height)
+
+    @property
+    def flow_area_per_unit_span(self) -> float:
+        return float(self.height)
+
+    @property
+    def wetted_perimeter_per_unit_span(self) -> float:
+        """Two parallel walls per unit span."""
+        return 2.0
+
+    @property
+    def hydraulic_diameter(self) -> float:
+        """D_h = 4 A'/P' = 2H."""
+        return float(2.0 * self.height)
+
+    @property
+    def aspect_ratio(self) -> float:
+        """Infinite-width parallel-wall limit."""
+        return float("inf")
+
+    def planform_area(self, length: float) -> float:
+        """In-plane area visible in the 2D airfoil, A_planform = L H."""
+        length = float(length)
+        if length <= 0.0:
+            raise ValueError("Channel length must be positive.")
+        return float(length * self.height)
 
 
 @dataclass
@@ -292,8 +362,22 @@ class PassageSpec:
     side1: str
     x2_frac: float
     side2: str
-    diameter_m: float = DEFAULT_PORE_DIAMETER
+    channel_height_m: float = DEFAULT_CHANNEL_HEIGHT
     layout_kind: str = "surface_pair"
+
+    def __post_init__(self) -> None:
+        if self.channel_height_m <= 0.0:
+            raise ValueError("channel_height_m must be positive.")
+
+    @property
+    def diameter_m(self) -> float:
+        """Backward-compatible alias returning rectangular channel height."""
+        return float(self.channel_height_m)
+
+    @property
+    def channel_width_m(self) -> float:
+        """Compatibility reference width for the per-unit-span model."""
+        return 1.0
 
 
 @dataclass(frozen=True)
@@ -335,17 +419,74 @@ def reynolds_to_velocity(
     return reynolds * mu / (rho * chord)
 
 
-def circular_laminar_resistance(
+def rectangular_hydraulic_diameter(
+    height_or_width: float,
+    height: float | None = None,
+) -> float:
+    """Return the 2D parallel-wall hydraulic diameter, D_h = 2H."""
+    h = float(height_or_width if height is None else height)
+    if h <= 0.0:
+        raise ValueError("Rectangular channel height must be positive.")
+    return float(2.0 * h)
+
+
+def rectangular_2d_laminar_resistance(
     mu: float,
     length: float,
-    diameter: float,
+    height: float,
 ) -> tuple[float, float]:
-    """
-    Poiseuille resistance for a circular internal channel.
+    """Return laminar resistance and flow area per unit span.
 
-        Rs = 128 mu L / (pi D^4)
-        Q  = dp / Rs
+    q' = Delta p H^3 / (12 mu L)
+    R' = Delta p / q' = 12 mu L / H^3
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(R_prime, A_prime)`` where ``A_prime = H``.
     """
-    area = 0.25 * np.pi * diameter**2
-    Rs = 128.0 * mu * length / max(np.pi * diameter**4, 1e-30)
-    return float(Rs), float(area)
+    mu = float(mu)
+    length = float(length)
+    height = float(height)
+
+    if mu <= 0.0:
+        raise ValueError("Dynamic viscosity must be positive.")
+    if length <= 0.0:
+        raise ValueError("Channel length must be positive.")
+    if height <= 0.0:
+        raise ValueError("Rectangular channel height must be positive.")
+
+    resistance_per_unit_span = 12.0 * mu * length / height**3
+    flow_area_per_unit_span = height
+    return float(resistance_per_unit_span), float(flow_area_per_unit_span)
+
+
+def square_channel_laminar_resistance(
+    mu: float,
+    length: float,
+    height: float,
+    series_terms: int = 50,
+) -> tuple[float, float]:
+    """Deprecated compatibility alias for the active 2D resistance."""
+    del series_terms
+    return rectangular_2d_laminar_resistance(mu, length, height)
+
+
+def rectangular_laminar_resistance(
+    mu: float,
+    length: float,
+    width: float | None = None,
+    height: float | None = None,
+    series_terms: int = 50,
+) -> tuple[float, float]:
+    """Compatibility wrapper for the 2D per-unit-span resistance."""
+    del series_terms
+    if height is None:
+        if width is None:
+            raise ValueError("height must be provided.")
+        height = float(width)
+    return rectangular_2d_laminar_resistance(
+        mu=float(mu),
+        length=float(length),
+        height=float(height),
+    )

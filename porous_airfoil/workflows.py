@@ -15,7 +15,7 @@ from .config import (
     AIRFOIL_NAME,
     AOA_DEG,
     AOA_SWEEP_END_DEG,
-    AOA_SWEEP_PORE_DIAMETERS,
+    AOA_SWEEP_CHANNEL_HEIGHTS,
     AOA_SWEEP_START_DEG,
     AOA_SWEEP_STEP_DEG,
     CHORD,
@@ -24,19 +24,18 @@ from .config import (
     COUPLING,
     EXPORT_AOA_SWEEP_PARAVIEW,
     EXPORT_PARAVIEW,
-    FIXED_AOA_PORE_DIAMETERS,
+    FIXED_AOA_CHANNEL_HEIGHTS,
     GeometryLimits,
     MAKE_CONTOUR_PLOTS,
-    MAKE_FIXED_AOA_DIAMETER_OUTPUTS,
+    MAKE_FIXED_AOA_CHANNEL_HEIGHT_OUTPUTS,
     MAKE_ZOOMED_CONTOUR_PLOTS,
     MU_INF,
     N_PANELS,
     OUTPUT_ROOT,
     P_INF,
-    PORE_DIAMETER,
+    CHANNEL_HEIGHT,
     REYNOLDS_EXTERNAL,
     RHO_INF,
-    RUN_MODE,
     SELECTED_MODEL,
     USE_XFOIL,
     XFOIL_OUTPUT_ROOT,
@@ -50,7 +49,7 @@ from .porous import (
     add_xfoil_to_sweep_comparison,
     build_base_problem,
     build_model_specs,
-    representative_pore_diameter,
+    representative_channel_height,
     run_one_model,
     run_porous_aoa_sweep_for_model,
     run_xfoil_aoa_sweep_for_case,
@@ -63,16 +62,6 @@ VALID_MODEL_NAMES = {
     "model_3_combined_independent",
     "model_4_saved_case_1",
 }
-
-VALID_RUN_MODES = {
-    "fixed",
-    "aoa_sweep",
-    "contours",
-    "streamlines",
-    "geometry",
-    "aero_plots",
-}
-
 
 def select_models(models: list[PorousModelSpec]) -> list[PorousModelSpec]:
     """Return the model list requested by ``config.SELECTED_MODEL``."""
@@ -94,35 +83,35 @@ def select_models(models: list[PorousModelSpec]) -> list[PorousModelSpec]:
     return selected
 
 
-def _unique_diameters(values: tuple[float, ...]) -> tuple[float, ...]:
-    """Return unique diameters while retaining their configured order."""
+def _unique_channel_heights(values: tuple[float, ...]) -> tuple[float, ...]:
+    """Return unique channel heights while retaining their configured order."""
     unique: list[float] = []
     for value in values:
-        diameter = float(value)
-        if not any(abs(diameter - old) <= 1.0e-15 for old in unique):
-            unique.append(diameter)
+        height = float(value)
+        if not any(abs(height - old) <= 1.0e-15 for old in unique):
+            unique.append(height)
     return tuple(unique)
 
 
-def _diameter_label(diameter_m: float) -> str:
-    return f"D_{1000.0 * float(diameter_m):.2f}mm".replace(".", "p")
+def _height_label(channel_height_m: float) -> str:
+    return f"H_{1000.0 * float(channel_height_m):.2f}mm".replace(".", "p")
 
 
-def _build_model_by_name(geom, model_name: str, diameter_m: float) -> PorousModelSpec:
+def _build_model_by_name(geom, model_name: str, channel_height_m: float) -> PorousModelSpec:
     matches = [
         model
-        for model in build_model_specs(geom=geom, diameter_m=float(diameter_m))
+        for model in build_model_specs(geom=geom, channel_height_m=float(channel_height_m))
         if model.name == model_name
     ]
     if not matches:
         raise RuntimeError(
-            f"Could not build {model_name!r} for diameter {diameter_m:.6e} m."
+            f"Could not build {model_name!r} for channel height {channel_height_m:.6e} m."
         )
     return matches[0]
 
 
 def run_fixed_cases() -> pd.DataFrame:
-    """Run configured fixed-angle porous-airfoil cases once per diameter."""
+    """Run configured fixed-angle porous-airfoil cases once per channel height."""
     n_panels = int(N_PANELS)
     contour_nx = int(CONTOUR_NX)
     contour_ny = int(CONTOUR_NY)
@@ -142,6 +131,9 @@ def run_fixed_cases() -> pd.DataFrame:
     print(f"Contour plots              : {bool(MAKE_CONTOUR_PLOTS)}")
     print(f"Contour grid               : {contour_nx} x {contour_ny}")
     print(f"Fixed-AoA ParaView         : {EXPORT_PARAVIEW}")
+    print("Hydraulic model            : 2D rectangular channel per unit span")
+    print("Flow area per unit span    : H")
+    print("Hydraulic diameter         : 2H")
     print(f"XFOIL enabled              : {USE_XFOIL}")
 
     flow, geom, _, aero_solver = build_base_problem(
@@ -175,24 +167,24 @@ def run_fixed_cases() -> pd.DataFrame:
         print("[ParaView] Fixed-AoA ParaView export disabled.")
 
     selected = select_models(
-        build_model_specs(geom=geom, diameter_m=float(PORE_DIAMETER))
+        build_model_specs(geom=geom, channel_height_m=float(CHANNEL_HEIGHT))
     )
 
-    diameters = (
-        _unique_diameters(tuple(float(value) for value in FIXED_AOA_PORE_DIAMETERS))
-        if MAKE_FIXED_AOA_DIAMETER_OUTPUTS
-        else (float(PORE_DIAMETER),)
+    channel_heights = (
+        _unique_channel_heights(tuple(float(value) for value in FIXED_AOA_CHANNEL_HEIGHTS))
+        if MAKE_FIXED_AOA_CHANNEL_HEIGHT_OUTPUTS
+        else (float(CHANNEL_HEIGHT),)
     )
-    if not diameters:
-        diameters = (float(PORE_DIAMETER),)
+    if not channel_heights:
+        channel_heights = (float(CHANNEL_HEIGHT),)
 
     rows: list[dict] = []
     for base_model in selected:
-        for diameter_m in diameters:
+        for channel_height_m in channel_heights:
             model = _build_model_by_name(
                 geom=geom,
                 model_name=base_model.name,
-                diameter_m=diameter_m,
+                channel_height_m=channel_height_m,
             )
             row = run_one_model(
                 model=model,
@@ -209,7 +201,7 @@ def run_fixed_cases() -> pd.DataFrame:
                 zoomed_xlim=ZOOMED_CONTOUR_XLIM,
                 zoomed_ylim=ZOOMED_CONTOUR_YLIM,
                 run_aoa_sweep=False,
-                output_name=f"{base_model.name}_{_diameter_label(diameter_m)}",
+                output_name=f"{base_model.name}_{_height_label(channel_height_m)}",
             )
             rows.append(row)
 
@@ -228,41 +220,48 @@ def run_sweep_for_model(
     geom,
     output_root: Path,
 ) -> pd.DataFrame:
-    """Run all configured diameters for one selected model."""
+    """Run all configured channel heights for one selected model."""
     model_dir = output_root / "aoa_sweep" / base_model.name
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    diameters = _unique_diameters(
-        tuple(float(value) for value in AOA_SWEEP_PORE_DIAMETERS)
+    channel_heights = _unique_channel_heights(
+        tuple(float(value) for value in AOA_SWEEP_CHANNEL_HEIGHTS)
     )
-    if not diameters:
-        diameters = (float(PORE_DIAMETER),)
+    if not channel_heights:
+        channel_heights = (float(CHANNEL_HEIGHT),)
 
     print()
     print("=" * 80)
     print(f"RUNNING AOA SWEEP FOR {base_model.name}")
     print("=" * 80)
-    print(base_model.description)
+    description_prefix = base_model.description.split(
+        "; in-plane opening H=",
+        maxsplit=1,
+    )[0]
+    print(
+        description_prefix
+        + "; 2D flow per unit span; D_h=2H."
+    )
     print(
         "AoA range [deg]            : "
         f"{AOA_SWEEP_START_DEG:g} to {AOA_SWEEP_END_DEG:g} "
         f"step {AOA_SWEEP_STEP_DEG:g}"
     )
-    print("Sweep diameters [m]        : " + ", ".join(f"{value:.6e}" for value in diameters))
+    print("Sweep channel heights [m]        : " + ", ".join(f"{value:.6e}" for value in channel_heights))
     print(f"Output folder              : {model_dir}")
 
     frames: list[pd.DataFrame] = []
-    paraview_reference_diameter = diameters[0]
+    paraview_reference_height = channel_heights[0]
 
-    for diameter_m in diameters:
-        model = _build_model_by_name(geom, base_model.name, diameter_m)
+    for channel_height_m in channel_heights:
+        model = _build_model_by_name(geom, base_model.name, channel_height_m)
         print(
             f"[Sweep] {model.name}, "
-            f"pore diameter = {representative_pore_diameter(model):.6e} m"
+            f"channel height = {representative_channel_height(model):.6e} m"
         )
         export_this = (
             bool(EXPORT_AOA_SWEEP_PARAVIEW)
-            and abs(diameter_m - paraview_reference_diameter) <= 1.0e-15
+            and abs(channel_height_m - paraview_reference_height) <= 1.0e-15
         )
         frame = run_porous_aoa_sweep_for_model(
             model=model,
@@ -280,7 +279,7 @@ def run_sweep_for_model(
             alpha_step=AOA_SWEEP_STEP_DEG,
             export_paraview=export_this,
             paraview_output_dir=(
-                model_dir / "aoa_sweep_paraview" / _diameter_label(diameter_m)
+                model_dir / "aoa_sweep_paraview" / _height_label(channel_height_m)
             ),
             field_nx=int(CONTOUR_NX),
             field_ny=int(CONTOUR_NY),
@@ -298,9 +297,27 @@ def run_sweep_for_model(
     if xfoil_sweep is not None:
         sweep_df = add_xfoil_to_sweep_comparison(sweep_df, xfoil_sweep)
 
+    # Always save the numerical table before checking convergence so a failed
+    # case can be inspected directly from the CSV.
     csv_path = model_dir / "aoa_sweep_comparison.csv"
     sweep_df.to_csv(csv_path, index=False)
     print(f"[CSV Saved] {csv_path}")
+
+    if "coupling_converged" in sweep_df.columns:
+        failed = sweep_df.loc[~sweep_df["coupling_converged"].astype(bool)]
+        if not failed.empty:
+            failed_cases = ", ".join(
+                f"(alpha={row.alpha_deg:g} deg, "
+                f"H={1000.0 * row.channel_height_m:.1f} mm)"
+                for row in failed.itertuples(index=False)
+            )
+            raise RuntimeError(
+                "AoA sweep contains non-converged porous cases after the "
+                f"nonlinear coupling solve: {failed_cases}. The CSV was saved, "
+                "but "
+                "the plot was not written because joining invalid points would "
+                "be misleading."
+            )
     plot_aoa_sweep_comparison(sweep_df=sweep_df, output_dir=model_dir)
     return sweep_df
 
@@ -332,7 +349,7 @@ def run_aoa_sweep() -> pd.DataFrame:
     print(f"Freestream speed [m/s]     : {flow.v_inf:.8f}")
 
     selected = select_models(
-        build_model_specs(geom=geom, diameter_m=float(PORE_DIAMETER))
+        build_model_specs(geom=geom, channel_height_m=float(CHANNEL_HEIGHT))
     )
     frames: list[pd.DataFrame] = []
     for base_model in selected:
@@ -351,29 +368,35 @@ def run_aoa_sweep() -> pd.DataFrame:
     return combined
 
 
-def run_selected_workflow(run_mode: str | None = None):
-    """Dispatch the configured workflow from the single project entry point."""
-    mode = str(run_mode or RUN_MODE).strip().lower()
-    if mode not in VALID_RUN_MODES:
-        raise ValueError(
-            f"Invalid RUN_MODE={mode!r}. Choose one of: {sorted(VALID_RUN_MODES)}"
-        )
+def run_all_workflows() -> dict[str, object]:
+    """Run the complete publication pipeline in its required order."""
+    from .plotting.aerodynamic import main as run_aerodynamic_plots
+    from .plotting.contours import main as run_contour_plots
+    from .plotting.geometry import main as run_geometry_plots
+    from .plotting.streamlines import main as run_streamline_plots
 
-    if mode == "fixed":
-        return run_fixed_cases()
-    if mode == "aoa_sweep":
-        return run_aoa_sweep()
-    if mode == "contours":
-        from .plotting.contours import main
-        return main()
-    if mode == "streamlines":
-        from .plotting.streamlines import main
-        return main()
-    if mode == "geometry":
-        from .plotting.geometry import main
-        return main()
-    if mode == "aero_plots":
-        from .plotting.aerodynamic import main
-        return main()
+    results: dict[str, object] = {}
 
-    raise AssertionError(f"Unhandled run mode: {mode}")
+    print("=" * 80)
+    print("RUNNING COMPLETE POROUS-AIRFOIL PIPELINE")
+    print("=" * 80)
+
+    print("\n[1/5] Running angle-of-attack sweep")
+    results["aoa_sweep"] = run_aoa_sweep()
+
+    print("\n[2/5] Creating aerodynamic plots")
+    results["aero_plots"] = run_aerodynamic_plots()
+
+    print("\n[3/5] Creating geometry plots")
+    results["geometry"] = run_geometry_plots()
+
+    print("\n[4/5] Creating contour plots")
+    results["contours"] = run_contour_plots()
+
+    print("\n[5/5] Creating streamline plots")
+    results["streamlines"] = run_streamline_plots()
+
+    print("=" * 80)
+    print("COMPLETE POROUS-AIRFOIL PIPELINE FINISHED")
+    print("=" * 80)
+    return results

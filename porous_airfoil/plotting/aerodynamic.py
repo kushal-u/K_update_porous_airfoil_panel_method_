@@ -320,7 +320,7 @@ try:
 except Exception:
     SEARCH_ROOT = Path(__file__).resolve().parents[2] / "outputs"
 
-OUTPUT_DIR = SEARCH_ROOT / "journal_aero_graphs_three_diameters"
+OUTPUT_DIR = SEARCH_ROOT / "aero_graphs_three_diameters"
 
 # Three diameters compared in every model panel.
 SELECT_PORE_DIAMETERS_M = (
@@ -621,7 +621,7 @@ def find_candidate_csv_files() -> list[Path]:
                 resolved = str(path)
 
             # Do not read this script's own exported plotting-data CSV.
-            if "journal_aero_graphs_three_diameters" in resolved:
+            if "aero_graphs_three_diameters" in resolved:
                 continue
 
             if resolved not in seen:

@@ -1,199 +1,110 @@
 # Porous Airfoil Panel Method
 
-A Python research pipeline for analysing porous NACA airfoils with a source–vortex panel method coupled to independent internal porous passages.
+A Python pipeline for analysing a porous airfoil using a source–vortex panel
+method coupled with independent internal rectangular channels.
 
-The project supports:
+The project calculates aerodynamic coefficients, surface pressure, internal
+channel flow and the resulting surface transpiration. It also generates
+publication-ready aerodynamic graphs, geometry plots, contour plots and
+streamline visualisations.
 
-- fixed-angle porous-airfoil calculations;
-- angle-of-attack sweeps;
-- XFOIL comparison;
-- pressure, velocity and pressure-coefficient contours;
-- lift and pitching-moment figures;
-- porous-network geometry figures;
-- external and approximate internal-channel streamline visualisation;
-- optional ParaView export.
+## Porous-airfoil models
 
-All workflows are launched from the project root through:
+The pipeline includes three porous configurations:
+
+1. **Horizontal model** – four independent chordwise channels.
+2. **Vertical model** – four independent lower-to-upper channels.
+3. **Horizontal and Veritcal model** – the horizontal and vertical channels combined while
+   remaining hydraulically independent.
+
+A solid airfoil solution is calculated as the reference case. Optional XFOIL
+results can also be included for comparison.
+
+## Installation
+
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/kushal-u/porous-airfoil-panel-method.git
+cd porous-airfoil-panel-method
+```
+
+Create a Python virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install the required packages:
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+## Running the pipeline
+
+Run the complete pipeline with:
 
 ```bash
 python3 run.py
 ```
 
+This runs the following stages in order:
 
-## Repository structure
+1. Angle-of-attack sweep
+2. Aerodynamic plots
+3. Porous-model geometry plots
+4. Pressure and velocity contours
+5. Streamline plots
 
-```text
-porous_airfoil_panel_method_restructured/
-├── ARCHITECTURE.md
-├── LICENSE
-├── README.md
-├── outputs/
-├── porous_airfoil/
-│   ├── __init__.py
-│   ├── __main__.py
-│   ├── config.py
-│   ├── porous.py
-│   ├── solver.py
-│   ├── workflows.py
-│   ├── integrations/
-│   │   ├── __init__.py
-│   │   ├── paraview.py
-│   │   └── xfoil.py
-│   └── plotting/
-│       ├── __init__.py
-│       ├── aerodynamic.py
-│       ├── common.py
-│       ├── contours.py
-│       ├── geometry.py
-│       └── streamlines.py
-├── pyproject.toml
-├── requirements.txt
-├── run.py
-└── xfoil/
-    └── xfoil/
-        ├── Xfoil699src.zip
-        ├── pplot.exe
-        ├── pxplot.exe
-        └── xfoil.exe
-```
-
-
-## Main modules
-
-| Module | Responsibility |
-|---|---|
-| `porous_airfoil/config.py` | User-editable settings, run mode, model selection, flow conditions, numerical tolerances and paths |
-| `porous_airfoil/solver.py` | NACA geometry generation and source–vortex panel-method solver |
-| `porous_airfoil/porous.py` | Porous passages, internal resistance, transpiration mapping and coupled solution |
-| `porous_airfoil/workflows.py` | Workflow selection and execution |
-| `porous_airfoil/integrations/xfoil.py` | XFOIL execution and result parsing |
-| `porous_airfoil/integrations/paraview.py` | VTK/PVD export for ParaView |
-| `porous_airfoil/plotting/aerodynamic.py` | Fixed-case plots, AoA-sweep plots and journal CL/CM figures |
-| `porous_airfoil/plotting/contours.py` | Final pressure, velocity and Cp difference contours |
-| `porous_airfoil/plotting/geometry.py` | Porous-airfoil model geometry figures and coordinate CSV files |
-| `porous_airfoil/plotting/streamlines.py` | Continuous external and approximate internal-channel streamlines |
-| `porous_airfoil/plotting/common.py` | Shared plotting, path and file-saving utilities |
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the software dependency structure.
-
-
+Results are written to the `outputs/` directory.
 
 ## Configuration
 
-Normal user settings are stored in:
+The main simulation settings are defined in:
 
 ```text
 porous_airfoil/config.py
 ```
-The default results folder is:
+
+This file contains the airfoil geometry, flow conditions, panel count, channel
+dimensions, angle-of-attack range, selected models and output options.
+
+## Project structure
 
 ```text
-outputs/
+porous-airfoil-panel-method/
+├── run.py                         # Main entry point
+├── porous_airfoil/
+│   ├── config.py                  # Simulation settings
+│   ├── solver.py                  # Source–vortex panel method
+│   ├── porous.py                  # Internal flow and coupled solution
+│   ├── workflows.py               # Analysis pipeline
+│   ├── plotting/                  # Graph and field plotting
+│   └── integrations/              # XFOIL and ParaView support
+├── outputs/                       # Generated results
+├── xfoil/                         # Optional XFOIL executable
+├── requirements.txt
+└── pyproject.toml
 ```
 
-All default paths are anchored to the project root rather than the terminal's current working directory.
+## Main outputs
 
-## Available workflows
+The pipeline produces:
 
-| Run mode | Purpose | Main output location |
-|---|---|---|
-| `fixed` | Fixed-AoA porous cases for the selected model and configured diameters | `outputs/` |
-| `aoa_sweep` | AoA sweep for the selected model or all models | `outputs/aoa_sweep/` |
-| `aero_plots` | Journal CL and CM figures generated from sweep CSV files | `outputs/journal_aero_graphs_three_diameters/` |
-| `geometry` | Porous-model layout figures and exact channel-coordinate CSV files | `outputs/results_discussion_porous_models/` |
-| `contours` | Journal velocity, pressure and Cp difference contours | `outputs/final_difference_contours_journal/` |
-| `streamlines` | External and approximate internal-channel streamline figures | `outputs/streamline_results/` |
+- lift and moment coefficient curves
+- AoA-sweep CSV files
+- porous-airfoil geometry figures
+- pressure and velocity difference contours
+- external and channel streamline plots
+- optional XFOIL comparison data
+- optional ParaView export files
 
-## Running one workflow
+Figures are exported in formats suitable for reports and journal publications,
+including PNG, PDF and SVG where configured.
 
-The easiest method is to select the run mode temporarily in the terminal.
+## License
 
-```bash
-POROUS_RUN_MODE=fixed python3 run.py
-```
-
-Other workflows:
-
-```bash
-POROUS_RUN_MODE=aoa_sweep python3 run.py
-POROUS_RUN_MODE=aero_plots python3 run.py
-POROUS_RUN_MODE=geometry python3 run.py
-POROUS_RUN_MODE=contours python3 run.py
-POROUS_RUN_MODE=streamlines python3 run.py
-```
-
-Alternatively, set `RUN_MODE` in `porous_airfoil/config.py` and then run:
-
-```bash
-python3 run.py
-```
-
-The equivalent package command is:
-
-```bash
-python3 -m porous_airfoil
-```
-
-## Running All Workflows
-
-From the project root, run:
-
-```bash
-POROUS_RUN_MODE=aoa_sweep python3 run.py &&
-POROUS_RUN_MODE=aero_plots python3 run.py &&
-POROUS_RUN_MODE=geometry python3 run.py &&
-POROUS_RUN_MODE=contours python3 run.py &&
-POROUS_RUN_MODE=streamlines python3 run.py
-```
-
-This runs the complete results and plotting pipeline in sequence:
-
-1. AoA sweep
-2. Journal CL and CM plots
-3. Porous-airfoil geometry figures
-4. Difference contour figures
-5. Streamline figures
-
-All generated files are saved in:
-
-```text
-outputs/
-```
-
-The next workflow starts only when the previous workflow finishes successfully.
-
-
-## Output structure
-
-The main generated result groups are:
-
-```text
-outputs/
-├── _xfoil/
-├── aoa_sweep/
-├── final_difference_contours_journal/
-├── journal_aero_graphs_three_diameters/
-├── results_discussion_porous_models/
-└── streamline_results/
-```
-
-The contents of `outputs/` are generated data and figures, not source code.
-
-## Model names
-
-The current compatible internal identifiers are:
-
-```text
-all
-model_1_4_chordwise
-model_2_9_perpendicular
-model_3_combined_independent
-model_4_saved_case_1
-```
-
-These identifiers are retained to remain compatible with existing folders, CSV files and plotting logic. Publication labels are normally shown as Horizontal, Vertical and Horizontal + Vertical.
-
-
-## Licence
-
-This project is released under the MIT License. See `LICENSE`.
+See [LICENSE](LICENSE) for the project licence.

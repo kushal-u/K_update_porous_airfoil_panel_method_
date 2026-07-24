@@ -79,7 +79,7 @@ MODEL_FOLDER_NAMES = {
     "model_3_combined_independent": "model_3_isotropic",
 }
 
-EXPORT_ROOT = Path(OUTPUT_ROOT) / "results_discussion_porous_models"
+EXPORT_ROOT = Path(OUTPUT_ROOT) / "porous_models"
 
 SAVE_FORMATS = ("png", "pdf", "svg")
 PNG_DPI = 1000

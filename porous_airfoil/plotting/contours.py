@@ -93,7 +93,7 @@ MODEL_FOLDER_NAMES = {
     "model_3_combined_independent": "Horizontal & Vertical",
 }
 
-OUTPUT_SUBDIR = "final_difference_contours_journal"
+OUTPUT_SUBDIR = "difference_contours"
 FINAL_CONTOUR_OUTPUT_ROOT = Path(OUTPUT_ROOT) / OUTPUT_SUBDIR
 
 SAVE_FORMATS = ("png", "pdf", "svg")

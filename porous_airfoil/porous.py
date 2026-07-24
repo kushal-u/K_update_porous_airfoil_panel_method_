@@ -1,21 +1,11 @@
-"""Porous-airfoil coupling with two-dimensional rectangular channels.
-
-The internal passages are rectangular slots in the airfoil cross-section and
-are solved per unit span.  The flow variable is therefore q [m^2/s], although
-the legacy ``PassageState.Q`` attribute is retained for compatibility with the
-existing workflow and plotting code.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from pathlib import Path
 import time
 
-from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
-
+from scipy.optimize import root
 from .solver import (
     CouplingConfig,
     FlowConfig,
@@ -44,7 +34,7 @@ from .config import (
     AOA_SWEEP_END_DEG,
     AOA_SWEEP_START_DEG,
     AOA_SWEEP_STEP_DEG,
-    AOA_SWEEP_PORE_DIAMETERS,
+    AOA_SWEEP_CHANNEL_HEIGHTS,
     CHORD,
     COUPLING,
     EXPORT_AOA_SWEEP_PARAVIEW,
@@ -68,528 +58,379 @@ from .config import (
     XFOIL_MACH,
     XFOIL_OUTPUT_ROOT,
     XFOIL_TIMEOUT,
+    rectangular_laminar_resistance,
     reynolds_to_velocity,
 )
-from .integrations.paraview import export_aoa_sweep_collections, export_paraview_files
 
+from .integrations.paraview import export_aoa_sweep_collections, export_paraview_files
 # =============================================================================
-# TWO-DIMENSIONAL RECTANGULAR-SLOT HYDRAULICS
+# INTERNAL CHANNEL HYDRAULIC RESISTANCE
 # =============================================================================
 INTERNAL_RE_TRANSITION = 2300.0
-MIN_OPENING_NORMAL_COMPONENT = 5.0e-2
-OPENING_TOLERANCE = 1.0e-10
 
 
-def _slot_darcy_friction_factor(reynolds: float) -> tuple[float, str]:
-    """Return the equivalent Darcy friction factor for a 2D slot.
+def _smooth_transition_weight(
+    reynolds: float,
+    re_low: float = 2000.0,
+    re_high: float = 3000.0,
+) -> float:
+    """Return a C1 smooth transition weight from laminar to turbulent flow."""
+    if reynolds <= re_low:
+        return 0.0
+    if reynolds >= re_high:
+        return 1.0
+    xi = (reynolds - re_low) / (re_high - re_low)
+    return float(xi * xi * (3.0 - 2.0 * xi))
 
-    Laminar flow is governed directly by the plane-Poiseuille equation.  The
-    value ``96/Re`` is retained only as its equivalent Darcy friction factor
-    for reporting and force checks.  Turbulent flow uses the smooth-slot
-    Blasius approximation.
-    """
-    re = float(reynolds)
-    if re <= 1.0e-12:
-        return float("inf"), "zero_flow"
-    if re < INTERNAL_RE_TRANSITION:
-        return 96.0 / re, "laminar_plane_poiseuille"
-    return 0.3164 / re**0.25, "turbulent_blasius_smooth_slot"
 
-def _rectangular_slot_pressure_drop_abs(
-    q_abs: float,
+def _rectangular_2d_pressure_drop_abs(
+    mean_velocity: float,
     rho: float,
     mu: float,
     length: float,
     height: float,
-) -> tuple[float, float, float, str, float, float, float]:
-    """Return pressure loss and derived quantities for ``|q|`` per unit span.
+) -> tuple[float, float, float, str]:
+    """Pressure drop for a 2D parallel-wall channel at a given mean velocity.
 
-    For ``Re < 2300`` the pressure loss is evaluated directly from the
-    plane-Poiseuille equation
-
-        dp = 12 * mu * L * q / h**3.
-
-    For ``Re >= 2300`` Darcy-Weisbach with the Blasius friction factor is used.
+    The hydraulic diameter is ``D_h = 2H``. The laminar Darcy factor
+    ``f = 96/Re_Dh`` reproduces exactly ``Delta p = 12 mu L U/H^2`` and hence
+    ``R' = 12 mu L/H^3``. A smooth blend to Blasius is used from Re=2000 to
+    Re=3000 so the pressure-flow law remains continuous during coupling.
     """
-    q_abs = abs(float(q_abs))
-    rho = float(rho)
-    mu = float(mu)
-    height = float(height)
-    length = float(length)
+    u = abs(float(mean_velocity))
+    if u <= 0.0:
+        return 0.0, 0.0, float("inf"), "zero_flow"
 
-    if rho <= 0.0:
-        raise ValueError("Fluid density must be positive.")
-    if mu <= 0.0:
-        raise ValueError("Dynamic viscosity must be positive.")
-    if height <= 0.0:
-        raise ValueError("Rectangular channel height must be positive.")
-    if length <= 0.0:
-        raise ValueError("Rectangular channel length must be positive.")
-    if q_abs <= 0.0:
-        return 0.0, 0.0, float("inf"), "zero_flow", 0.0, 0.0, 0.0
+    hydraulic_diameter = 2.0 * float(height)
+    reynolds = rho * u * hydraulic_diameter / max(mu, 1.0e-30)
 
-    mean_speed = q_abs / height
-    hydraulic_diameter = 2.0 * height
-    reynolds = rho * mean_speed * hydraulic_diameter / mu
+    f_laminar = 96.0 / max(reynolds, 1.0e-30)
+    f_turbulent = 0.3164 / max(reynolds, 1.0e-30) ** 0.25
+    blend = _smooth_transition_weight(reynolds)
+    friction_factor = (1.0 - blend) * f_laminar + blend * f_turbulent
 
-    if reynolds < INTERNAL_RE_TRANSITION:
-        # Plane Poiseuille flow between two parallel walls separated by h.
-        dp_abs = 12.0 * mu * length * q_abs / height**3
-        friction_factor = 96.0 / max(reynolds, 1.0e-30)
-        model_name = "laminar_plane_poiseuille"
-        wall_shear = 6.0 * mu * mean_speed / height
-    else:
-        friction_factor = 0.3164 / reynolds**0.25
-        model_name = "turbulent_blasius_smooth_slot"
-        dynamic_pressure = 0.5 * rho * mean_speed**2
-        dp_abs = friction_factor * (length / hydraulic_diameter) * dynamic_pressure
-        wall_shear = friction_factor * rho * mean_speed**2 / 8.0
-
-    # Two wetted walls, each of length L, per unit span.
-    wall_force_per_span = 2.0 * wall_shear * length
-
-    return (
-        float(dp_abs),
-        float(reynolds),
-        float(friction_factor),
-        str(model_name),
-        float(mean_speed),
-        float(wall_shear),
-        float(wall_force_per_span),
+    pressure_drop = (
+        friction_factor
+        * (length / hydraulic_diameter)
+        * 0.5
+        * rho
+        * u**2
     )
 
-def solve_rectangular_slot_flow(
+    if reynolds <= 2000.0:
+        model_name = "laminar_2d_rectangular_12muL_over_H3"
+    elif reynolds < 3000.0:
+        model_name = "transition_2d_rectangular_smooth_blend"
+    else:
+        model_name = "turbulent_2d_rectangular_blasius"
+
+    return (
+        float(pressure_drop),
+        float(reynolds),
+        float(friction_factor),
+        model_name,
+    )
+
+
+def solve_rectangular_channel_flow(
     dp: float,
     rho: float,
     mu: float,
     length: float,
     height: float,
-) -> tuple[float, float, float, float, str, float, float, float]:
-    """Solve the rectangular-slot flow rate per unit span from ``p1-p2``.
-
-    The laminar candidate is obtained directly from plane Poiseuille flow.  It
-    is accepted when its Reynolds number is below 2300.  Only the turbulent
-    branch requires a nonlinear bisection solve.
+) -> tuple[float, float, float, float, str]:
+    """Solve the 2D rectangular-channel flow rate per unit span.
 
     Returns
     -------
     tuple
-        ``q, equivalent_R, Re, f_D, model, U, tau_w, F_wall_per_span``.
+        ``q_prime, R_prime_equivalent, Re_Dh, f_D, model_name``.
+
+    Notes
+    -----
+    ``q_prime`` has units m^2/s. The flow-through area per unit span is H,
+    therefore ``U_bar = q_prime/H``. The visible in-plane area ``L*H`` is not
+    used as the flow-through area.
     """
     dp = float(dp)
-    dp_abs = abs(dp)
     rho = float(rho)
     mu = float(mu)
     length = float(length)
     height = float(height)
 
-    if rho <= 0.0:
-        raise ValueError("Fluid density must be positive.")
-    if mu <= 0.0:
-        raise ValueError("Dynamic viscosity must be positive.")
-    if length <= 0.0:
-        raise ValueError("Rectangular channel length must be positive.")
-    if height <= 0.0:
-        raise ValueError("Rectangular channel height must be positive.")
-    if dp_abs <= 0.0:
-        return (
-            0.0, float("inf"), 0.0, float("inf"), "zero_flow",
-            0.0, 0.0, 0.0,
-        )
+    if not all(np.isfinite(value) for value in (dp, rho, mu, length, height)):
+        raise FloatingPointError("Non-finite rectangular-channel input.")
+    if rho <= 0.0 or mu <= 0.0 or length <= 0.0 or height <= 0.0:
+        raise ValueError("Density, viscosity, length and channel height must be positive.")
+
+    dp_abs = abs(dp)
+    if dp_abs <= 1.0e-30:
+        return 0.0, float("inf"), 0.0, float("inf"), "zero_flow"
 
     sign = 1.0 if dp >= 0.0 else -1.0
 
-    # ------------------------------------------------------------------
-    # Laminar candidate: direct plane-Poiseuille solution.
-    # q = dp*h^3/(12*mu*L), where q is flow per unit span [m^2/s].
-    # ------------------------------------------------------------------
-    poiseuille_resistance = 12.0 * mu * length / height**3
-    q_poiseuille_abs = dp_abs / poiseuille_resistance
-    mean_speed_poiseuille = q_poiseuille_abs / height
-    hydraulic_diameter = 2.0 * height
-    reynolds_poiseuille = (
-        rho * mean_speed_poiseuille * hydraulic_diameter / mu
-    )
-
-    if reynolds_poiseuille < INTERNAL_RE_TRANSITION:
-        friction_factor = 96.0 / max(reynolds_poiseuille, 1.0e-30)
-        wall_shear = 6.0 * mu * mean_speed_poiseuille / height
-        wall_force_per_span = 2.0 * wall_shear * length
-
-        return (
-            float(sign * q_poiseuille_abs),
-            float(poiseuille_resistance),
-            float(reynolds_poiseuille),
-            float(friction_factor),
-            "laminar_plane_poiseuille",
-            float(sign * mean_speed_poiseuille),
-            float(wall_shear),
-            float(wall_force_per_span),
-        )
-
-    # ------------------------------------------------------------------
-    # Turbulent branch: Darcy-Weisbach + Blasius, solved by bisection.
-    # ------------------------------------------------------------------
-    def turbulent_pressure_drop(q_abs: float) -> tuple[float, float, float, float, float]:
-        mean_speed = q_abs / height
-        reynolds = rho * mean_speed * hydraulic_diameter / mu
-        friction_factor = 0.3164 / max(reynolds, 1.0e-30) ** 0.25
-        dynamic_pressure = 0.5 * rho * mean_speed**2
-        pressure_drop = (
-            friction_factor
-            * (length / hydraulic_diameter)
-            * dynamic_pressure
-        )
-        wall_shear = friction_factor * rho * mean_speed**2 / 8.0
-        wall_force = 2.0 * wall_shear * length
-        return pressure_drop, reynolds, friction_factor, wall_shear, wall_force
-
-    q_low = 0.0
-    q_high = max(q_poiseuille_abs, height, 1.0e-12)
-
+    # Bracket and solve the monotonic pressure-drop law in mean velocity.
+    u_low = 0.0
+    u_high = 1.0
     for _ in range(100):
-        dp_high, *_ = turbulent_pressure_drop(q_high)
+        dp_high, _, _, _ = _rectangular_2d_pressure_drop_abs(
+            mean_velocity=u_high,
+            rho=rho,
+            mu=mu,
+            length=length,
+            height=height,
+        )
         if dp_high >= dp_abs:
             break
-        q_high *= 2.0
+        u_high *= 2.0
     else:
-        raise RuntimeError(
-            "Could not bracket the turbulent rectangular-channel flow solution."
+        raise RuntimeError("Could not bracket the rectangular-channel flow solution.")
+
+    for _ in range(80):
+        u_mid = 0.5 * (u_low + u_high)
+        dp_mid, _, _, _ = _rectangular_2d_pressure_drop_abs(
+            mean_velocity=u_mid,
+            rho=rho,
+            mu=mu,
+            length=length,
+            height=height,
         )
-
-    for _ in range(90):
-        q_mid = 0.5 * (q_low + q_high)
-        dp_mid, *_ = turbulent_pressure_drop(q_mid)
         if dp_mid < dp_abs:
-            q_low = q_mid
+            u_low = u_mid
         else:
-            q_high = q_mid
+            u_high = u_mid
 
-    q_abs = 0.5 * (q_low + q_high)
-    (
-        _dp_check,
-        reynolds,
-        friction_factor,
-        wall_shear,
-        wall_force_per_span,
-    ) = turbulent_pressure_drop(q_abs)
-    mean_speed = q_abs / height
-    equivalent_resistance = dp_abs / max(q_abs, 1.0e-30)
+    mean_velocity = 0.5 * (u_low + u_high)
+    _, reynolds, friction_factor, model_name = _rectangular_2d_pressure_drop_abs(
+        mean_velocity=mean_velocity,
+        rho=rho,
+        mu=mu,
+        length=length,
+        height=height,
+    )
+
+    q_prime_abs = mean_velocity * height
+    equivalent_resistance = dp_abs / max(q_prime_abs, 1.0e-30)
+
+    if not all(
+        np.isfinite(value)
+        for value in (q_prime_abs, equivalent_resistance, reynolds, friction_factor)
+    ):
+        raise FloatingPointError("Non-finite rectangular-channel result.")
 
     return (
-        float(sign * q_abs),
+        float(sign * q_prime_abs),
         float(equivalent_resistance),
         float(reynolds),
         float(friction_factor),
-        "turbulent_blasius_smooth_slot",
-        float(sign * mean_speed),
-        float(wall_shear),
-        float(wall_force_per_span),
-    )
-
-def solve_internal_channel_flow(
-    dp: float,
-    rho: float,
-    mu: float,
-    length: float,
-    diameter: float | None = None,
-    area: float | None = None,
-    height: float | None = None,
-) -> tuple[float, float, float, float, str]:
-    """Compatibility wrapper returning the historical five-value tuple.
-
-    In the rectangular formulation ``area`` is the flow area per unit span and
-    is numerically equal to the channel height.  ``diameter`` is interpreted as
-    hydraulic diameter only when no height/area value is supplied.
-    """
-    if height is None:
-        if area is not None:
-            height = float(area)
-        elif diameter is not None:
-            height = 0.5 * float(diameter)
-        else:
-            raise ValueError("A rectangular channel height is required.")
-
-    q, resistance, re, f_d, model, *_ = solve_rectangular_slot_flow(
-        dp=dp, rho=rho, mu=mu, length=length, height=float(height)
-    )
-    return q, resistance, re, f_d, model
-
-
-@dataclass(frozen=True)
-class OpeningPatch:
-    """Exact fractional panel coverage of one rectangular surface opening."""
-
-    panel_ids: np.ndarray
-    overlap_lengths_m: np.ndarray
-    panel_open_fractions: np.ndarray
-    opening_length_m: float
-    normal_component: float
-    surface_point: SurfacePoint
-
-
-def _segment_distance(
-    p1: np.ndarray, p2: np.ndarray, q1: np.ndarray, q2: np.ndarray
-) -> float:
-    """Return the minimum distance between two 2D line segments."""
-    def point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-        ab = b - a
-        denom = float(np.dot(ab, ab))
-        if denom <= 1.0e-30:
-            return float(np.linalg.norm(p - a))
-        t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
-        return float(np.linalg.norm(p - (a + t * ab)))
-
-    def orient(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-        return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-
-    o1, o2 = orient(p1, p2, q1), orient(p1, p2, q2)
-    o3, o4 = orient(q1, q2, p1), orient(q1, q2, p2)
-    if o1 * o2 <= 0.0 and o3 * o4 <= 0.0:
-        return 0.0
-
-    return min(
-        point_segment_distance(p1, q1, q2),
-        point_segment_distance(p2, q1, q2),
-        point_segment_distance(q1, p1, p2),
-        point_segment_distance(q2, p1, p2),
+        str(model_name),
     )
 
 
 # =============================================================================
-# ONE INDEPENDENT RECTANGULAR CHANNEL
+# ONE INDEPENDENT CHANNEL
 # =============================================================================
 class IndependentPassage:
-    """One straight rectangular slot solved per unit span."""
-
     def __init__(
         self,
         name: str,
         pore1: Pore,
         pore2: Pore,
         chamber: Chamber,
-        span_width: float | None = None,
+        span_width: float,
         layout_kind: str = "surface_pair",
     ) -> None:
-        self.name = str(name)
+        self.name = name
         self.pore1 = pore1
         self.pore2 = pore2
         self.chamber = chamber
+        self.span_width = float(span_width)
         self.layout_kind = str(layout_kind)
-
-        # Retained only so existing callers do not break.  The rectangular-slot
-        # physics is per unit span and does not use this value.
-        self.span_width = None if span_width is None else float(span_width)
-
-    @property
-    def channel_height_m(self) -> float:
-        """Return the full 2D rectangular channel height."""
-        for obj in (self.pore1, self.pore2, self.chamber):
-            for attr in ("channel_height_m", "height_m", "height", "diameter"):
-                value = getattr(obj, attr, None)
-                if value is not None:
-                    value = float(value)
-                    if np.isfinite(value) and value > 0.0:
-                        return value
-
-        # In the current compatibility data model the chamber hydraulic
-        # diameter is explicitly set to 2h.
-        dh = float(getattr(self.chamber, "hydraulic_diameter", 0.0))
-        if dh > 0.0:
-            return 0.5 * dh
-        raise ValueError(f"{self.name}: no positive channel height is available.")
-
-    @property
-    def hydraulic_diameter_m(self) -> float:
-        return 2.0 * self.channel_height_m
-
-    @property
-    def area_per_unit_span_m(self) -> float:
-        """Flow area per unit span; numerically equal to channel height."""
-        return self.channel_height_m
 
     def pore_surface_point(self, geom: PanelGeometry, pore: Pore) -> SurfacePoint:
         return geom.surface_point_from_fraction(pore.x_frac, pore.side)
 
-    def channel_endpoints(
-        self, geom: PanelGeometry
-    ) -> tuple[SurfacePoint, SurfacePoint, np.ndarray]:
+    def passage_length(self, geom: PanelGeometry) -> float:
         sp1 = self.pore_surface_point(geom, self.pore1)
         sp2 = self.pore_surface_point(geom, self.pore2)
-        delta = np.array([sp2.x - sp1.x, sp2.y - sp1.y], dtype=float)
-        length = float(np.linalg.norm(delta))
-        if length <= 1.0e-14:
-            raise ValueError(f"{self.name}: channel endpoints are coincident.")
-        return sp1, sp2, delta / length
 
-    def passage_length(self, geom: PanelGeometry) -> float:
-        """Straight inlet-to-outlet channel length."""
-        sp1, sp2, _ = self.channel_endpoints(geom)
-        return max(float(np.hypot(sp2.x - sp1.x, sp2.y - sp1.y)), 1.0e-12)
+        def safe_thickness(x_frac: float) -> float:
+            if x_frac <= 1e-8 or x_frac >= 1.0 - 1e-8:
+                return 0.0
+            return geom.local_thickness_at_fraction(x_frac)
 
-    def _opening_length(
-        self, geom: PanelGeometry, pore: Pore, surface_point: SurfacePoint
-    ) -> tuple[float, float]:
-        """Return the skin-intersection length of the rectangular slot."""
-        _sp1, _sp2, direction = self.channel_endpoints(geom)
-        normal = np.array([surface_point.nx, surface_point.ny], dtype=float)
-        normal_norm = float(np.linalg.norm(normal))
-        if normal_norm <= 1.0e-14:
-            raise ValueError(f"{self.name}: invalid surface normal at an opening.")
-        normal /= normal_norm
-        normal_component = abs(float(np.dot(direction, normal)))
+        t1 = safe_thickness(self.pore1.x_frac)
+        t2 = safe_thickness(self.pore2.x_frac)
 
-        if normal_component < MIN_OPENING_NORMAL_COMPONENT:
-            raise ValueError(
-                f"{self.name}: channel intersects the {pore.side} surface too "
-                f"tangentially (|e·n|={normal_component:.4f})."
-            )
+        straight = np.hypot(sp2.x - sp1.x, sp2.y - sp1.y)
 
-        opening_length = self.channel_height_m / normal_component
-        return float(opening_length), float(normal_component)
+        # Model 1 uses constant-y horizontal, straight internal channels.
+        # Do not add extra endpoint-thickness length for this geometry.
+        if self.layout_kind in {"internal_horizontal", "internal_chordwise_horizontal"}:
+            return max(float(straight), 1e-6)
 
-    def opening_patch(self, geom: PanelGeometry, pore: Pore) -> OpeningPatch:
-        """Map the exact rectangular opening to fractional surface panels."""
-        sp = self.pore_surface_point(geom, pore)
-        opening_length, normal_component = self._opening_length(geom, pore, sp)
+        return max(float(straight + 0.5 * t1 + 0.5 * t2), 1e-6)
 
-        candidate_ids = (
-            np.asarray(geom.upper_panel_ids, dtype=int)
-            if pore.side == "upper"
-            else np.asarray(geom.lower_panel_ids, dtype=int)
-        )
-        candidate_ids = np.sort(candidate_ids)
-        if candidate_ids.size == 0:
-            raise RuntimeError(f"{self.name}: no panels found on {pore.side} surface.")
-
-        lengths = np.asarray(geom.S[candidate_ids], dtype=float)
-        starts = np.concatenate([[0.0], np.cumsum(lengths[:-1])])
-        ends = starts + lengths
-
-        matches = np.flatnonzero(candidate_ids == int(sp.panel_id))
-        if matches.size:
-            local_index = int(matches[0])
-        else:
-            distances = (geom.XC[candidate_ids] - sp.x) ** 2 + (
-                geom.YC[candidate_ids] - sp.y
-            ) ** 2
-            local_index = int(np.argmin(distances))
-
-        panel_id = int(candidate_ids[local_index])
-        x0 = float(geom.XB[panel_id])
-        y0 = float(geom.YB[panel_id])
-        panel_length = max(float(geom.S[panel_id]), 1.0e-16)
-        tangent = np.array(
-            [geom.XB[panel_id + 1] - x0, geom.YB[panel_id + 1] - y0],
-            dtype=float,
-        ) / panel_length
-        local_distance = float(
-            np.clip(np.dot(np.array([sp.x - x0, sp.y - y0]), tangent), 0.0, panel_length)
-        )
-        centre_s = float(starts[local_index] + local_distance)
-
-        interval_start = centre_s - 0.5 * opening_length
-        interval_end = centre_s + 0.5 * opening_length
-        overlaps = np.maximum(
-            0.0, np.minimum(ends, interval_end) - np.maximum(starts, interval_start)
-        )
-        active = overlaps > OPENING_TOLERANCE
-
-        ids = candidate_ids[active]
-        overlap_lengths = overlaps[active]
-        fractions = overlap_lengths / np.maximum(geom.S[ids], 1.0e-16)
-        represented_length = float(np.sum(overlap_lengths))
-
-        if not ids.size or not np.isclose(
-            represented_length, opening_length, rtol=1.0e-8, atol=1.0e-10
-        ):
-            raise ValueError(
-                f"{self.name}: rectangular opening of length "
-                f"{opening_length:.6e} m does not fit on the {pore.side} surface "
-                f"at x/c={pore.x_frac:.6f}. Represented length is "
-                f"{represented_length:.6e} m."
-            )
-
-        return OpeningPatch(
-            panel_ids=np.asarray(ids, dtype=int),
-            overlap_lengths_m=np.asarray(overlap_lengths, dtype=float),
-            panel_open_fractions=np.asarray(fractions, dtype=float),
-            opening_length_m=float(opening_length),
-            normal_component=float(normal_component),
-            surface_point=sp,
-        )
 
     def validate_geometry(self, geom: PanelGeometry, limits: GeometryLimits) -> None:
-        """Validate a finite-height rectangular channel inside the airfoil."""
-        height = self.channel_height_m
-        if height <= 0.0:
-            raise ValueError(f"{self.name}: channel height must be positive.")
-
-        for label, pore in (("opening1", self.pore1), ("opening2", self.pore2)):
+        for label, pore in (("pore1", self.pore1), ("pore2", self.pore2)):
             if not (limits.x_min_frac <= pore.x_frac <= limits.x_max_frac):
                 raise ValueError(
                     f"{self.name}:{label} x/c={pore.x_frac:.4f} is outside "
-                    f"[{limits.x_min_frac}, {limits.x_max_frac}]."
+                    f"[{limits.x_min_frac}, {limits.x_max_frac}]"
                 )
-            self.opening_patch(geom, pore)
 
-        sp1, sp2, direction = self.channel_endpoints(geom)
-        length = self.passage_length(geom)
-        if length <= height + float(limits.min_gap):
+            is_endpoint_pore = (
+                abs(pore.x_frac - 0.0) <= limits.endpoint_tol
+                or abs(pore.x_frac - 1.0) <= limits.endpoint_tol
+            )
+
+            # Exact LE/TE surface points have zero local thickness in 2D.
+            # They are allowed only as endpoint pores.
+            if not is_endpoint_pore:
+                thickness = geom.local_thickness_at_fraction(pore.x_frac)
+
+                if pore.height > limits.thickness_fraction_limit * thickness:
+                    raise ValueError(
+                        f"{self.name}:{label} height={pore.height:.4e} is too large "
+                        f"for local thickness={thickness:.4e}"
+                    )
+
+        sp1 = self.pore_surface_point(geom, self.pore1)
+        sp2 = self.pore_surface_point(geom, self.pore2)
+
+        dist = float(np.hypot(sp2.x - sp1.x, sp2.y - sp1.y))
+        required = 0.5 * (self.pore1.height + self.pore2.height) + limits.min_gap
+
+        if dist < required:
             raise ValueError(
-                f"{self.name}: channel length {length:.6e} m is too short for "
-                f"height {height:.6e} m."
+                f"{self.name} pore centers are too close: distance={dist:.4e}, "
+                f"required={required:.4e}"
             )
 
-        # Check the rectangular corridor away from the two oblique skin cuts.
-        # The required inset follows from the local line-plane intersection of
-        # the channel side wall with the airfoil tangent.
-        transverse = np.array([-direction[1], direction[0]], dtype=float)
+        x_min = min(self.pore1.x_frac, self.pore2.x_frac)
+        x_max = max(self.pore1.x_frac, self.pore2.x_frac)
 
-        def opening_inset(surface_point: SurfacePoint) -> float:
-            normal = np.array([surface_point.nx, surface_point.ny], dtype=float)
-            normal /= max(float(np.linalg.norm(normal)), 1.0e-16)
-            denominator = max(abs(float(np.dot(normal, direction))), 1.0e-12)
-            geometric = (
-                0.5 * height * abs(float(np.dot(normal, transverse))) / denominator
+        # Skip exact LE/TE zero-thickness locations for chamber fit checking.
+        check_x_min = max(x_min, limits.endpoint_fit_margin)
+        check_x_max = min(x_max, 1.0 - limits.endpoint_fit_margin)
+
+        if check_x_min <= check_x_max:
+            if abs(check_x_max - check_x_min) <= 1e-12:
+                xs = np.array([check_x_min])
+            else:
+                xs = np.linspace(check_x_min, check_x_max, 40)
+
+            t_min = min(geom.local_thickness_at_fraction(float(x)) for x in xs)
+
+            if self.chamber.height > limits.fit_fraction * t_min:
+                raise ValueError(
+                    f"{self.name} rectangular channel is too tall for the minimum local thickness. "
+                    f"height={self.chamber.height:.4e}, t_min={t_min:.4e}"
+                )
+
+    def equivalent_reynolds(self, q_abs: float, flow: FlowConfig) -> float:
+        """Return Re based on q' per unit span and D_h=2H."""
+        u_internal = q_abs / max(self.chamber.height, 1e-16)
+        return (
+            flow.rho_inf
+            * abs(u_internal)
+            * (2.0 * self.chamber.height)
+            / max(flow.mu_inf, 1e-16)
+        )
+
+
+    def _surface_patch_weights(
+        self,
+        geom: PanelGeometry,
+        pore: Pore,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return panel IDs and exact opening-overlap lengths for one pore.
+
+        The physical pore opening is exactly ``H`` along the surface. Partial
+        end panels receive fractional overlap weights. This removes the old
+        mesh-dependent rules based on a minimum panel count or ``3H`` patch.
+        """
+        if pore.side == "upper":
+            candidate_ids = np.asarray(geom.upper_panel_ids, dtype=int)
+        else:
+            candidate_ids = np.asarray(geom.lower_panel_ids, dtype=int)
+
+        if candidate_ids.size == 0:
+            raise RuntimeError(f"No panels available on the {pore.side} surface.")
+
+        # On each individual airfoil side, x is monotonic from LE to TE.
+        order = np.argsort(geom.XC[candidate_ids])
+        ids = candidate_ids[order]
+        panel_lengths = np.asarray(geom.S[ids], dtype=float)
+
+        edges = np.concatenate([[0.0], np.cumsum(panel_lengths)])
+        mids = 0.5 * (edges[:-1] + edges[1:])
+
+        surface_point = self.pore_surface_point(geom, pore)
+        s_center = float(
+            np.interp(
+                surface_point.x,
+                geom.XC[ids],
+                mids,
+                left=mids[0],
+                right=mids[-1],
             )
-            return geometric + 0.10 * height
+        )
 
-        start_margin = opening_inset(sp1)
-        end_margin = opening_inset(sp2)
-        if start_margin + end_margin >= 0.90 * length:
+        opening = float(pore.height)
+        total_surface_length = float(edges[-1])
+        if opening > total_surface_length:
             raise ValueError(
-                f"{self.name}: the rectangular opening cuts consume too much of "
-                "the available channel length."
+                f"{self.name}: pore opening H={opening:.6e} m exceeds the "
+                f"available {pore.side} surface length {total_surface_length:.6e} m."
             )
 
-        s_values = np.linspace(start_margin, length - end_margin, 60)
-        centre0 = np.array([sp1.x, sp1.y], dtype=float)
-        points: list[np.ndarray] = []
-        for s_value in s_values:
-            centre = centre0 + s_value * direction
-            for eta in (-0.499, 0.0, 0.499):
-                points.append(centre + eta * height * transverse)
+        s_start = s_center - 0.5 * opening
+        s_end = s_center + 0.5 * opening
 
-        polygon = MplPath(np.column_stack([geom.XB, geom.YB]), closed=True)
-        inside = polygon.contains_points(np.asarray(points), radius=1.0e-12)
-        if not bool(np.all(inside)):
-            raise ValueError(
-                f"{self.name}: the finite-height rectangular channel leaves the "
-                "airfoil interior. Reduce the channel height or move the channel."
+        # Shift, rather than truncate, an opening that touches a side endpoint.
+        if s_start < 0.0:
+            s_end -= s_start
+            s_start = 0.0
+        if s_end > total_surface_length:
+            s_start -= s_end - total_surface_length
+            s_end = total_surface_length
+        s_start = max(0.0, s_start)
+
+        overlap = np.maximum(
+            0.0,
+            np.minimum(edges[1:], s_end) - np.maximum(edges[:-1], s_start),
+        )
+        active = overlap > 1.0e-15
+        selected_ids = ids[active]
+        selected_overlap = overlap[active]
+
+        actual_opening = float(np.sum(selected_overlap))
+        if not np.isclose(actual_opening, opening, rtol=0.0, atol=1.0e-10):
+            raise RuntimeError(
+                f"{self.name}: surface patch length {actual_opening:.6e} m does "
+                f"not match H={opening:.6e} m."
             )
+
+        return selected_ids, selected_overlap
+
 
     def _area_average_pressure_at_pore(
         self,
         geom: PanelGeometry,
         pore: Pore,
         panel_pressures: np.ndarray,
+        min_panels: int = 0,
     ) -> float:
-        """Average pressure over the exact rectangular opening footprint."""
-        patch = self.opening_patch(geom, pore)
-        pressure = np.asarray(panel_pressures, dtype=float)[patch.panel_ids]
-        weights = patch.overlap_lengths_m
-        return float(np.sum(pressure * weights) / max(np.sum(weights), 1.0e-16))
+        """Length-average pressure over the exact rectangular pore opening."""
+        del min_panels
+        ids, overlap = self._surface_patch_weights(geom=geom, pore=pore)
+        return float(
+            np.sum(panel_pressures[ids] * overlap)
+            / max(np.sum(overlap), 1.0e-16)
+        )
+
 
     def solve(
         self,
@@ -597,109 +438,82 @@ class IndependentPassage:
         panel_pressures: np.ndarray,
         flow: FlowConfig,
     ) -> PassageState:
-        """Solve one rectangular channel using exact opening pressures."""
-        p1 = self._area_average_pressure_at_pore(geom, self.pore1, panel_pressures)
-        p2 = self._area_average_pressure_at_pore(geom, self.pore2, panel_pressures)
-        dp = p1 - p2
-        length = self.passage_length(geom)
-        height = self.channel_height_m
-
-        (
-            q, resistance, reynolds, friction_factor, resistance_model,
-            mean_velocity, wall_shear, wall_force_per_span,
-        ) = solve_rectangular_slot_flow(
-            dp=dp,
-            rho=flow.rho_inf,
-            mu=flow.mu_inf,
-            length=length,
-            height=height,
+        """
+        Solve one internal channel using surface-patch averaged pore pressures.
+        """
+        p1 = self._area_average_pressure_at_pore(
+            geom=geom,
+            pore=self.pore1,
+            panel_pressures=panel_pressures,
+            min_panels=9,
+        )
+        p2 = self._area_average_pressure_at_pore(
+            geom=geom,
+            pore=self.pore2,
+            panel_pressures=panel_pressures,
+            min_panels=9,
         )
 
-        state = PassageState(
-            Q=float(q),  # compatibility: now q per unit span [m^2/s]
-            p1=float(p1),
-            p2=float(p2),
+        dp = p1 - p2
+
+        length = self.passage_length(geom)
+        q, rs, reynolds, friction_factor, resistance_model = (
+            solve_rectangular_channel_flow(
+                dp=dp,
+                rho=flow.rho_inf,
+                mu=flow.mu_inf,
+                length=length,
+                height=self.chamber.height,
+            )
+        )
+
+        return PassageState(
+            Q=float(q),
+            p1=p1,
+            p2=p2,
             dp_total=float(abs(dp)),
-            Rs=float(resistance),
+            Rs=float(rs),
             reynolds_equivalent=float(reynolds),
             friction_factor=float(friction_factor),
             resistance_model=str(resistance_model),
         )
 
-        # Explicit rectangular-channel fields.  PassageState is intentionally
-        # extended dynamically so the existing config dataclass remains usable.
-        state.flow_rate_per_unit_span_m2_s = float(q)
-        state.mean_velocity_m_s = float(mean_velocity)
-        state.channel_height_m = float(height)
-        state.hydraulic_diameter_m = float(2.0 * height)
-        state.wall_shear_pa = float(wall_shear)
-        state.wetted_wall_length_per_unit_span_m = float(2.0 * length)
-        state.wall_force_per_span_n_m = float(wall_force_per_span)
-        state.pressure_force_per_span_n_m = float(abs(dp) * height)
-        state.force_balance_error_per_span_n_m = float(
-            wall_force_per_span - abs(dp) * height
-        )
-
-        sp1, sp2, direction_12 = self.channel_endpoints(geom)
-        flow_direction = direction_12 if q >= 0.0 else -direction_12
-        state.flow_direction_x = float(flow_direction[0])
-        state.flow_direction_y = float(flow_direction[1])
-        state.internal_force_x_per_span_n_m = float(
-            wall_force_per_span * flow_direction[0]
-        )
-        state.internal_force_y_per_span_n_m = float(
-            wall_force_per_span * flow_direction[1]
-        )
-        state.channel_midpoint_x_m = 0.5 * float(sp1.x + sp2.x)
-        state.channel_midpoint_y_m = 0.5 * float(sp1.y + sp2.y)
-        return state
 
     def transpiration_from_flow(
-        self, geom: PanelGeometry, state: PassageState
+        self,
+        geom: PanelGeometry,
+        state: PassageState,
     ) -> np.ndarray:
-        """Map q per unit span to exact opening-normal panel velocities."""
+        """Map q' [m^2/s] to panel-normal velocity over an opening of length H.
+
+        The panel-average values conserve flow exactly:
+
+            sum(v_n,i S_i) = +/- q'
+
+        No out-of-plane span width appears because both the internal and
+        external coupling are formulated per unit span.
+        """
         vn = np.zeros(geom.num_pan, dtype=float)
-        q = float(state.Q)
-        if abs(q) < 1.0e-30:
+
+        q_prime = float(state.Q)
+        if abs(q_prime) < 1.0e-30:
             return vn
 
-        patch1 = self.opening_patch(geom, self.pore1)
-        patch2 = self.opening_patch(geom, self.pore2)
+        ids1, overlap1 = self._surface_patch_weights(geom, self.pore1)
+        ids2, overlap2 = self._surface_patch_weights(geom, self.pore2)
 
-        for patch, signed_q in ((patch1, -q), (patch2, q)):
-            opening_velocity = signed_q / patch.opening_length_m
-            vn[patch.panel_ids] += opening_velocity * patch.panel_open_fractions
+        opening1 = max(float(np.sum(overlap1)), 1.0e-16)
+        opening2 = max(float(np.sum(overlap2)), 1.0e-16)
+
+        # Uniform physical velocity over the opening, represented as a
+        # panel-average when an opening cuts through a partial panel.
+        vn[ids1] -= q_prime * overlap1 / (opening1 * geom.S[ids1])
+        vn[ids2] += q_prime * overlap2 / (opening2 * geom.S[ids2])
 
         return vn
 
-    def opening_fraction(self, geom: PanelGeometry) -> np.ndarray:
-        fraction = np.zeros(geom.num_pan, dtype=float)
-        for pore in (self.pore1, self.pore2):
-            patch = self.opening_patch(geom, pore)
-            fraction[patch.panel_ids] += patch.panel_open_fractions
-        return fraction
-
-    def normal_velocity_mean_square_from_flow(
-        self, geom: PanelGeometry, state: PassageState
-    ) -> np.ndarray:
-        """Return the panel-area mean of local opening normal velocity squared."""
-        values = np.zeros(geom.num_pan, dtype=float)
-        q = float(state.Q)
-        if abs(q) < 1.0e-30:
-            return values
-        for patch in (
-            self.opening_patch(geom, self.pore1),
-            self.opening_patch(geom, self.pore2),
-        ):
-            local_velocity = q / patch.opening_length_m
-            values[patch.panel_ids] += (
-                local_velocity**2 * patch.panel_open_fractions
-            )
-        return values
-
-
 # =============================================================================
-# NETWORK OF INDEPENDENT RECTANGULAR CHANNELS
+# NETWORK OF INDEPENDENT CHANNELS
 # =============================================================================
 class IndependentPassageNetwork:
     def __init__(self, passages: list[IndependentPassage]) -> None:
@@ -711,151 +525,72 @@ class IndependentPassageNetwork:
         for passage in self.passages:
             passage.validate_geometry(geom, limits)
 
-        # Channels in the same hydraulic layer may not overlap.  Cross-layout
-        # intersections in the combined model are retained as the documented
-        # idealised independent-layer superposition.
-        for i, passage_i in enumerate(self.passages):
-            sp1_i, sp2_i, _ = passage_i.channel_endpoints(geom)
-            p1 = np.array([sp1_i.x, sp1_i.y])
-            p2 = np.array([sp2_i.x, sp2_i.y])
-            for passage_j in self.passages[i + 1 :]:
-                if passage_i.layout_kind != passage_j.layout_kind:
-                    continue
-                sp1_j, sp2_j, _ = passage_j.channel_endpoints(geom)
-                q1 = np.array([sp1_j.x, sp1_j.y])
-                q2 = np.array([sp2_j.x, sp2_j.y])
-                distance = _segment_distance(p1, p2, q1, q2)
-                required = (
-                    0.5 * passage_i.channel_height_m
-                    + 0.5 * passage_j.channel_height_m
-                    + float(limits.min_gap)
+        pore_refs: list[tuple[str, Pore, SurfacePoint]] = []
+        for passage in self.passages:
+            pore_refs.append(
+                (
+                    f"{passage.name}:pore1",
+                    passage.pore1,
+                    passage.pore_surface_point(geom, passage.pore1),
                 )
-                if distance < required:
+            )
+            pore_refs.append(
+                (
+                    f"{passage.name}:pore2",
+                    passage.pore2,
+                    passage.pore_surface_point(geom, passage.pore2),
+                )
+            )
+
+        for i in range(len(pore_refs)):
+            name_i, pore_i, sp_i = pore_refs[i]
+
+            for j in range(i + 1, len(pore_refs)):
+                name_j, pore_j, sp_j = pore_refs[j]
+
+                dist = float(np.hypot(sp_i.x - sp_j.x, sp_i.y - sp_j.y))
+                required = 0.5 * (pore_i.height + pore_j.height) + limits.min_gap
+
+                if dist < required:
                     raise ValueError(
-                        f"Rectangular channels {passage_i.name!r} and "
-                        f"{passage_j.name!r} overlap: distance={distance:.6e} m, "
-                        f"required={required:.6e} m."
+                        f"Pore overlap between {name_i} and {name_j}: "
+                        f"distance={dist:.4e}, required={required:.4e}"
                     )
 
-        # Openings belonging to the same layout layer may not cover the same
-        # part of a panel.
-        by_layout: dict[str, np.ndarray] = {}
-        for passage in self.passages:
-            values = by_layout.setdefault(
-                passage.layout_kind, np.zeros(geom.num_pan, dtype=float)
-            )
-            values += passage.opening_fraction(geom)
-        for layout, values in by_layout.items():
-            if np.any(values > 1.0 + 1.0e-8):
-                raise ValueError(
-                    f"Rectangular surface openings overlap in layout {layout!r}."
-                )
-
-    def opening_fraction(self, geom: PanelGeometry) -> np.ndarray:
-        opening = np.zeros(geom.num_pan, dtype=float)
-        for passage in self.passages:
-            opening += passage.opening_fraction(geom)
-        # Cross-layout overlap represents separate idealised spanwise layers and
-        # is not allowed to remove more than the complete external wall.
-        return np.clip(opening, 0.0, 1.0)
-
-    def wall_fraction(self, geom: PanelGeometry) -> np.ndarray:
-        return 1.0 - self.opening_fraction(geom)
-
     def solve(
-        self, geom: PanelGeometry, panel_pressures: np.ndarray, flow: FlowConfig
+        self,
+        geom: PanelGeometry,
+        panel_pressures: np.ndarray,
+        flow: FlowConfig,
     ) -> list[PassageState]:
         return [
-            passage.solve(geom=geom, panel_pressures=panel_pressures, flow=flow)
+            passage.solve(
+                geom=geom,
+                panel_pressures=panel_pressures,
+                flow=flow,
+            )
             for passage in self.passages
         ]
 
     def transpiration_from_flow(
-        self, geom: PanelGeometry, states: list[PassageState]
+        self,
+        geom: PanelGeometry,
+        states: list[PassageState],
     ) -> np.ndarray:
-        if len(states) != len(self.passages):
-            raise ValueError("One passage state is required for every passage.")
         vn = np.zeros(geom.num_pan, dtype=float)
+
         for passage, state in zip(self.passages, states):
-            vn += passage.transpiration_from_flow(geom=geom, state=state)
+            vn += passage.transpiration_from_flow(
+                geom=geom,
+                state=state,
+            )
+
         return vn
 
-    def normal_velocity_mean_square_from_flow(
-        self, geom: PanelGeometry, states: list[PassageState]
-    ) -> np.ndarray:
-        if len(states) != len(self.passages):
-            raise ValueError("One passage state is required for every passage.")
-        values = np.zeros(geom.num_pan, dtype=float)
-        for passage, state in zip(self.passages, states):
-            values += passage.normal_velocity_mean_square_from_flow(geom, state)
-        return values
-
-
-def _add_internal_channel_forces(
-    aero_result,
-    network: IndependentPassageNetwork,
-    states: list[PassageState],
-    aero_solver: SourceVortexPanelMethod,
-):
-    """Add internal wall-shear force and moment to the external-wall result."""
-    flow = aero_solver.flow
-    geom = aero_solver.geom
-    ref = aero_solver.ref
-
-    force_x = 0.0
-    force_y = 0.0
-    moment = 0.0
-
-    for state in states:
-        fx = float(getattr(state, "internal_force_x_per_span_n_m", 0.0))
-        fy = float(getattr(state, "internal_force_y_per_span_n_m", 0.0))
-        x_mid = float(getattr(state, "channel_midpoint_x_m", ref.x_ref))
-        y_mid = float(getattr(state, "channel_midpoint_y_m", ref.y_ref))
-        m = (x_mid - ref.x_ref) * fy - (y_mid - ref.y_ref) * fx
-        state.internal_moment_per_span_n = float(m)
-        force_x += fx
-        force_y += fy
-        moment += m
-
-    q_inf = 0.5 * flow.rho_inf * flow.v_inf**2
-    force_scale = max(q_inf * geom.chord, 1.0e-30)
-    moment_scale = max(q_inf * geom.chord**2, 1.0e-30)
-
-    internal_Cx = force_x / force_scale
-    internal_Cy = force_y / force_scale
-    alpha = np.deg2rad(flow.aoa_deg)
-    internal_CL = internal_Cy * np.cos(alpha) - internal_Cx * np.sin(alpha)
-    internal_CD = internal_Cx * np.cos(alpha) + internal_Cy * np.sin(alpha)
-    internal_CM = moment / moment_scale
-
-    total_Cx = aero_result.external_wall_Cx + internal_Cx
-    total_Cy = aero_result.external_wall_Cy + internal_Cy
-    total_CL = aero_result.external_wall_CL + internal_CL
-    total_CD = aero_result.external_wall_CD + internal_CD
-    total_CM = aero_result.external_wall_CM + internal_CM
-
-    return replace(
-        aero_result,
-        Cx=float(total_Cx),
-        Cy=float(total_Cy),
-        CL=float(total_CL),
-        CD=float(total_CD),
-        CM=float(total_CM),
-        internal_channel_Cx=float(internal_Cx),
-        internal_channel_Cy=float(internal_Cy),
-        internal_channel_CL=float(internal_CL),
-        internal_channel_CD=float(internal_CD),
-        internal_channel_CM=float(internal_CM),
-        total_Cx=float(total_Cx),
-        total_Cy=float(total_Cy),
-        total_CL=float(total_CL),
-        total_CD=float(total_CD),
-        total_CM=float(total_CM),
-    )
 
 
 # =============================================================================
-# COUPLED PANEL + RECTANGULAR-CHANNEL SOLVER
+# COUPLED PANEL + POROUS SOLVER
 # =============================================================================
 class MultiPassageCoupledSolver:
     def __init__(
@@ -870,111 +605,220 @@ class MultiPassageCoupledSolver:
         self.coupling = coupling
         self.limits = limits
 
-    def solve(self, verbose: bool = False) -> MultiPassageResult:
+    def solve(
+        self,
+        verbose: bool = False,
+        initial_vn: np.ndarray | None = None,
+    ) -> MultiPassageResult:
+        """Solve the coupled pressure-flow equations as a nonlinear root problem.
+
+        The unknowns are dimensionless flow rates per unit span in the
+        independent passages. Each physical flow rate is scaled by ``H V_inf``
+        before it is passed to the nonlinear solver. For a trial flow vector,
+        the method maps the flow to panel transpiration, solves the external
+        panel method, calculates the pore pressures, and obtains a new
+        hydraulic flow vector. The dimensionless residual is
+
+            residual = (trial flow - pressure-driven flow) / (H V_inf).
+
+        No under-relaxation or user-defined coupling tolerance is applied.
+        SciPy's nonlinear solver supplies its machine-precision-aware stopping
+        logic, while ``max_iter`` remains a safety limit on residual
+        evaluations. Convergence is classified from the scaled residual using
+        the finite-difference resolution of double-precision arithmetic, not
+        from SciPy's status flag alone.
+
+        If ``initial_vn`` is provided, it is used only to form a passage-flow
+        starting guess. It does not alter the coupled equations.
+        """
         geom = self.aero_solver.geom
         flow = self.aero_solver.flow
+
         self.network.validate_geometry(geom, self.limits)
 
-        opening_fraction = self.network.opening_fraction(geom)
-        wall_fraction = 1.0 - opening_fraction
-        vn = np.zeros(geom.num_pan, dtype=float)
-        vn_mean_square = np.zeros(geom.num_pan, dtype=float)
-        previous_q: list[float] | None = None
-        converged = False
-        final_iteration = 0
-
-        for iteration in range(1, self.coupling.max_iter + 1):
-            aero_result = self.aero_solver.solve(
-                normal_transpiration=vn,
-                wall_fraction=wall_fraction,
-                normal_velocity_mean_square=vn_mean_square,
-            )
-            panel_pressures = self.aero_solver.panel_pressures(aero_result)
-            states = self.network.solve(geom, panel_pressures, flow)
-            vn_target = self.network.transpiration_from_flow(geom, states)
-            vn_mean_square_target = (
-                self.network.normal_velocity_mean_square_from_flow(geom, states)
-            )
-            vn_new = (
-                (1.0 - self.coupling.relaxation) * vn
-                + self.coupling.relaxation * vn_target
-            )
-            vn_mean_square_new = (
-                (1.0 - self.coupling.relaxation) * vn_mean_square
-                + self.coupling.relaxation * vn_mean_square_target
-            )
-
-            current_q = [float(state.Q) for state in states]
-            dq = (
-                np.inf
-                if previous_q is None
-                else max(
-                    abs(q_new - q_old)
-                    for q_new, q_old in zip(current_q, previous_q)
+        n_passages = len(self.network.passages)
+        if initial_vn is None:
+            starting_vn = np.zeros(geom.num_pan, dtype=float)
+        else:
+            starting_vn = np.asarray(initial_vn, dtype=float).copy()
+            if starting_vn.shape != (geom.num_pan,):
+                raise ValueError(
+                    f"initial_vn must have shape ({geom.num_pan},), "
+                    f"got {starting_vn.shape}."
                 )
+            if not np.all(np.isfinite(starting_vn)):
+                raise ValueError("initial_vn must contain only finite values.")
+
+        last_finite_vn = starting_vn.copy()
+        last_finite_aero = self.aero_solver.solve(
+            normal_transpiration=starting_vn
+        )
+        last_finite_pressures = self.aero_solver.panel_pressures(last_finite_aero)
+        last_finite_states = self.network.solve(
+            geom=geom,
+            panel_pressures=last_finite_pressures,
+            flow=flow,
+        )
+        initial_q = np.asarray(
+            [float(state.Q) for state in last_finite_states],
+            dtype=float,
+        )
+        q_scale = np.asarray(
+            [
+                max(
+                    float(passage.chamber.height) * float(flow.v_inf),
+                    np.finfo(float).tiny,
+                )
+                for passage in self.network.passages
+            ],
+            dtype=float,
+        )
+        initial_q_dimensionless = initial_q / q_scale
+        evaluation_count = 0
+        numerical_failure = False
+
+        def states_for_trial_flow(q_trial: np.ndarray) -> list[PassageState]:
+            """Create lightweight states for the linear Q-to-vn mapping."""
+            return [
+                PassageState(
+                    Q=float(q_value),
+                    p1=0.0,
+                    p2=0.0,
+                    dp_total=0.0,
+                    Rs=0.0,
+                    reynolds_equivalent=0.0,
+                )
+                for q_value in q_trial
+            ]
+
+        def coupling_residual(
+            q_trial_dimensionless: np.ndarray,
+        ) -> np.ndarray:
+            nonlocal evaluation_count
+            nonlocal last_finite_vn
+            nonlocal last_finite_aero
+            nonlocal last_finite_states
+
+            evaluation_count += 1
+            q_trial_dimensionless = np.asarray(
+                q_trial_dimensionless,
+                dtype=float,
             )
-            dvn = float(np.max(np.abs(vn_new - vn)))
+            if (
+                q_trial_dimensionless.shape != (n_passages,)
+                or not np.all(np.isfinite(q_trial_dimensionless))
+            ):
+                raise FloatingPointError("Non-finite passage-flow trial state.")
+            q_trial = q_trial_dimensionless * q_scale
+
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                vn_trial = self.network.transpiration_from_flow(
+                    geom=geom,
+                    states=states_for_trial_flow(q_trial),
+                )
+                aero_result = self.aero_solver.solve(
+                    normal_transpiration=vn_trial
+                )
+                panel_pressures = self.aero_solver.panel_pressures(aero_result)
+                hydraulic_states = self.network.solve(
+                    geom=geom,
+                    panel_pressures=panel_pressures,
+                    flow=flow,
+                )
+
+            q_pressure_driven = np.asarray(
+                [float(state.Q) for state in hydraulic_states],
+                dtype=float,
+            )
+            residual = (q_trial - q_pressure_driven) / q_scale
+
+            if (
+                not np.all(np.isfinite(vn_trial))
+                or not np.all(np.isfinite(panel_pressures))
+                or not np.all(np.isfinite(q_pressure_driven))
+                or not np.all(np.isfinite(residual))
+                or not np.isfinite(aero_result.CL)
+            ):
+                raise FloatingPointError("Non-finite coupled state.")
+
+            last_finite_vn = vn_trial.copy()
+            last_finite_aero = aero_result
+            last_finite_states = hydraulic_states
 
             if verbose:
-                max_q = max((abs(q) for q in current_q), default=0.0)
-                boundary_flux = float(np.sum(vn_new * geom.S))
                 print(
-                    f"[Coupling] iter={iteration:03d} | "
-                    f"external CL={aero_result.external_wall_CL: .8f} | "
-                    f"max|q|={max_q: .6e} m2/s | "
-                    f"dvn={dvn: .3e} | dq={dq: .3e} | "
-                    f"net flux={boundary_flux: .3e} m2/s"
+                    f"[Coupling] evaluation={evaluation_count:03d} | "
+                    f"CL={aero_result.CL: .8f} | "
+                    f"max|Q|={np.max(np.abs(q_trial)): .6e} | "
+                    f"max|scaled residual|={np.max(np.abs(residual)): .3e}"
                 )
 
-            vn = vn_new
-            vn_mean_square = vn_mean_square_new
-            previous_q = current_q
-            final_iteration = iteration
-            if dvn < self.coupling.tol_vn and dq < self.coupling.tol_q:
-                converged = True
-                break
+            return residual
 
-        aero_external = self.aero_solver.solve(
-            normal_transpiration=vn,
-            wall_fraction=wall_fraction,
-            normal_velocity_mean_square=vn_mean_square,
-        )
-        panel_pressures = self.aero_solver.panel_pressures(aero_external)
-        states = self.network.solve(geom, panel_pressures, flow)
-        aero_total = _add_internal_channel_forces(
-            aero_result=aero_external,
-            network=self.network,
-            states=states,
-            aero_solver=self.aero_solver,
-        )
+        try:
+            nonlinear_result = root(
+                coupling_residual,
+                initial_q_dimensionless,
+                method="hybr",
+                options={"maxfev": int(self.coupling.max_iter)},
+            )
+            final_q_dimensionless = np.asarray(
+                nonlinear_result.x,
+                dtype=float,
+            )
+            if np.all(np.isfinite(final_q_dimensionless)):
+                final_residual = coupling_residual(final_q_dimensionless)
+            else:
+                numerical_failure = True
+                final_residual = np.full(n_passages, np.inf, dtype=float)
 
-        max_vn = float(np.max(np.abs(vn)))
-        result = MultiPassageResult(
-            aero_result=aero_total,
-            passage_states=states,
-            normal_transpiration=vn,
-            converged=converged,
+            residual_norm = float(np.max(np.abs(final_residual)))
+            state_scale = max(
+                1.0,
+                float(np.max(np.abs(final_q_dimensionless))),
+            )
+            floating_point_resolution = (
+                np.sqrt(np.finfo(float).eps) * state_scale
+            )
+            residual_resolved = residual_norm <= floating_point_resolution
+            converged = bool(
+                not numerical_failure
+                and residual_resolved
+            )
+            final_iteration = int(
+                getattr(nonlinear_result, "nfev", evaluation_count)
+            )
+
+            if verbose:
+                print(
+                    f"[Coupling] nonlinear solve: "
+                    f"success={nonlinear_result.success}, "
+                    f"evaluations={final_iteration}, "
+                    f"max|scaled residual|={residual_norm:.3e}, "
+                    f"message={nonlinear_result.message}"
+                )
+        except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
+            converged = False
+            numerical_failure = True
+            final_iteration = evaluation_count
+            if verbose:
+                print(
+                    f"[Coupling] nonlinear solve stopped after "
+                    f"{evaluation_count} evaluations: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        max_vn = float(np.max(np.abs(last_finite_vn)))
+        return MultiPassageResult(
+            aero_result=last_finite_aero,
+            passage_states=last_finite_states,
+            normal_transpiration=last_finite_vn,
+            converged=bool(converged),
             iterations=final_iteration,
             max_vn=max_vn,
-            max_vn_over_vinf=max_vn / max(flow.v_inf, 1.0e-16),
+            max_vn_over_vinf=max_vn / max(flow.v_inf, 1e-16),
         )
 
-        # Additional decomposition and diagnostics without breaking the existing
-        # lightweight result dataclass in config.py.
-        result.opening_fraction = opening_fraction
-        result.wall_fraction = wall_fraction
-        result.normal_velocity_mean_square = vn_mean_square
-        result.boundary_flux_per_unit_span_m2_s = float(np.sum(vn * geom.S))
-        result.external_wall_CL = float(aero_total.external_wall_CL)
-        result.external_wall_CD = float(aero_total.external_wall_CD)
-        result.external_wall_CM = float(aero_total.external_wall_CM)
-        result.internal_channel_CL = float(aero_total.internal_channel_CL)
-        result.internal_channel_CD = float(aero_total.internal_channel_CD)
-        result.internal_channel_CM = float(aero_total.internal_channel_CM)
-        result.total_CL = float(aero_total.total_CL)
-        result.total_CD = float(aero_total.total_CD)
-        result.total_CM = float(aero_total.total_CM)
-        return result
 
 
 # =============================================================================
@@ -1214,25 +1058,15 @@ def model1_le_te_surface_pores(
 
 def build_model1_chordwise(
     geom: PanelGeometry,
-    diameter_m: float,
+    channel_height_m: float,
 ) -> list[PassageSpec]:
-    """
-    Model 1:
-        4 horizontal straight internal channels.
-
-    Each channel is generated from a constant y/c level.  The two pore
-    positions are the left and right intersections of that horizontal line
-    with the airfoil surface, so the plotted/exported internal passage is a
-    straight horizontal line.
-    """
+    """Build four horizontal in-plane rectangular channels."""
     horizontal_channels = model1_horizontal_surface_pores(
         geom=geom,
         n_channels=4,
         max_y_fraction=0.85,
     )
-
     passages: list[PassageSpec] = []
-
     for i, (x1, side1, x2, side2, y_level) in enumerate(horizontal_channels, start=1):
         y_label = "upper" if y_level >= 0.0 else "lower"
         passages.append(
@@ -1242,23 +1076,20 @@ def build_model1_chordwise(
                 side1=side1,
                 x2_frac=x2,
                 side2=side2,
-                diameter_m=diameter_m,
+                channel_height_m=float(channel_height_m),
                 layout_kind="internal_horizontal",
             )
         )
-
     return passages
+
 
 def build_vertical_passages(
     x_values: np.ndarray,
-    diameter_m: float,
+    channel_height_m: float,
     prefix: str,
 ) -> list[PassageSpec]:
-    """
-    Build lower-to-upper perpendicular channels.
-    """
+    """Build lower-to-upper in-plane rectangular channels."""
     passages: list[PassageSpec] = []
-
     for i, x in enumerate(x_values, start=1):
         passages.append(
             PassageSpec(
@@ -1267,11 +1098,10 @@ def build_vertical_passages(
                 side1="lower",
                 x2_frac=float(x),
                 side2="upper",
-                diameter_m=diameter_m,
+                channel_height_m=float(channel_height_m),
                 layout_kind="perpendicular",
             )
         )
-
     return passages
 
 
@@ -1280,139 +1110,106 @@ def _copy_passages_with_prefix(
     prefix: str,
     label: str,
 ) -> list[PassageSpec]:
-    """
-    Copy passage definitions and rename them.
-
-    Used by Model 3 so it can reuse the exact Model 1 channel geometry.
-    """
-    copied: list[PassageSpec] = []
-
-    for i, passage in enumerate(passages, start=1):
-        copied.append(
-            PassageSpec(
-                name=f"{prefix}_{i:02d}_{label}",
-                x1_frac=passage.x1_frac,
-                side1=passage.side1,
-                x2_frac=passage.x2_frac,
-                side2=passage.side2,
-                diameter_m=passage.diameter_m,
-                layout_kind=passage.layout_kind,
-            )
-        )
-
-    return copied
-
-
-# =============================================================================
-# MODEL 4: SAVED CASE 1 FROM OLD run_test.py
-# =============================================================================
-def build_model4_saved_case1(diameter_m: float | None = None) -> list[PassageSpec]:
-    """
-    Model 4:
-        Saved case_1 from the old run_test.py validation script.
-
-    The legacy ``diameter_m`` input is interpreted as rectangular channel height.
-    This keeps existing workflow calls compatible.
-    """
-    if diameter_m is None:
-        d1 = 1.2e-02
-        d2 = 0.9e-02
-    else:
-        d1 = float(diameter_m)
-        d2 = float(diameter_m)
-
+    """Copy rectangular passage definitions and rename them."""
     return [
         PassageSpec(
-            name="m4_case1_passage_01_lower_to_upper",
-            x1_frac=0.400094,
-            side1="lower",
-            x2_frac=0.933001,
-            side2="upper",
-            diameter_m=d1,
-            layout_kind="saved_case_1",
-        ),
+            name=f"{prefix}_{i:02d}_{label}",
+            x1_frac=passage.x1_frac,
+            side1=passage.side1,
+            x2_frac=passage.x2_frac,
+            side2=passage.side2,
+            channel_height_m=passage.channel_height_m,
+            layout_kind=passage.layout_kind,
+        )
+        for i, passage in enumerate(passages, start=1)
+    ]
+
+
+def build_model4_saved_case1(
+    channel_height_m: float | None = None,
+) -> list[PassageSpec]:
+    """Build saved case 1 using one-parameter rectangular passages."""
+    heights = (1.2e-02, 0.9e-02) if channel_height_m is None else (
+        float(channel_height_m), float(channel_height_m)
+    )
+    locations = (
+        ("m4_case1_passage_01_lower_to_upper", 0.400094, 0.933001),
+        ("m4_case1_passage_02_lower_to_upper", 0.925069, 0.955118),
+    )
+    return [
         PassageSpec(
-            name="m4_case1_passage_02_lower_to_upper",
-            x1_frac=0.925069,
+            name=name,
+            x1_frac=x1,
             side1="lower",
-            x2_frac=0.955118,
+            x2_frac=x2,
             side2="upper",
-            diameter_m=d2,
+            channel_height_m=height,
             layout_kind="saved_case_1",
-        ),
+        )
+        for (name, x1, x2), height in zip(locations, heights)
     ]
 
 
 def build_model_specs(
     geom: PanelGeometry,
-    diameter_m: float,
+    channel_height_m: float | None = None,
+    *,
+    diameter_m: float | None = None,
+    channel_width_m: float | None = None,
 ) -> list[PorousModelSpec]:
+    """Build all 2D rectangular models from the in-plane opening H.
+
+    ``diameter_m`` remains a compatibility alias for H. ``channel_width_m`` is
+    ignored because the active equations are per unit span.
     """
-    Build the fixed porous models.
+    if channel_height_m is None:
+        if diameter_m is None:
+            raise ValueError("channel_height_m must be provided.")
+        channel_height_m = float(diameter_m)
+    elif diameter_m is not None and not np.isclose(channel_height_m, diameter_m):
+        raise ValueError("Provide channel_height_m or diameter_m, not conflicting values.")
 
-    The legacy ``diameter_m`` argument is the rectangular channel height for all
-    generated passages.
-    """
-    model_1_chordwise = build_model1_chordwise(
-        geom=geom,
-        diameter_m=diameter_m,
+    height = float(channel_height_m)
+    # Accepted only so older callers do not fail. The value is not used by the
+    # active per-unit-span hydraulic equations.
+    _ = channel_width_m
+
+    model_1 = build_model1_chordwise(geom, height)
+    model_2 = build_vertical_passages(np.linspace(0.100, 0.900, 4), height, "m2")
+    model_3h = _copy_passages_with_prefix(model_1, "m3c", "LE_to_TE_internal_channel")
+    model_3v = build_vertical_passages(np.linspace(0.100, 0.900, 4), height, "m3v")
+    # model_4 = build_model4_saved_case1(height)
+
+    size_text = (
+        f"in-plane opening H={1000.0*height:.1f} mm; "
+        "2D flow per unit span; D_h=2H"
     )
-
-    model_2_perpendicular = build_vertical_passages(
-        x_values=np.linspace(0.100, 0.900, 4),
-        diameter_m=diameter_m,
-        prefix="m2",
-    )
-
-    model_3_chordwise = _copy_passages_with_prefix(
-        passages=model_1_chordwise,
-        prefix="m3c",
-        label="LE_to_TE_internal_channel",
-    )
-
-    model_3_perpendicular = build_vertical_passages(
-        x_values=np.linspace(0.100, 0.900, 4),
-        diameter_m=diameter_m,
-        prefix="m3v",
-    )
-
-    model_3_combined = model_3_chordwise + model_3_perpendicular
-
-    
-    model_4_saved_case1 = build_model4_saved_case1(diameter_m=diameter_m)
-
     return [
         PorousModelSpec(
             name="model_1_4_chordwise",
-            description=(
-                "4 straight horizontal rectangular channels at constant y/c levels. "
-                "Each channel is solved per unit span."
-            ),
-            passages=tuple(model_1_chordwise),
+            description="4 straight horizontal rectangular channels; " + size_text + ".",
+            passages=tuple(model_1),
         ),
         PorousModelSpec(
             name="model_2_9_perpendicular",
-            description="4 independent lower-to-upper rectangular channels.",
-            passages=tuple(model_2_perpendicular),
+            description="4 independent lower-to-upper rectangular channels; " + size_text + ".",
+            passages=tuple(model_2),
         ),
         PorousModelSpec(
             name="model_3_combined_independent",
             description=(
-                "Idealised independent-layer combination of 4 horizontal and "
-                "4 vertical rectangular channels. Crossings are not hydraulic junctions."
+                "Combined horizontal and vertical rectangular channels. "
+                "All 8 passages are independent; internal intersections are not connected; "
+                + size_text + "."
             ),
-            passages=tuple(model_3_combined),
+            passages=tuple(model_3h + model_3v),
         ),
-        PorousModelSpec(
-            name="model_4_saved_case_1",
-            description=(
-                "Saved two-passage rectangular-channel case with fixed surface "
-                "locations. The legacy diameter value is interpreted as channel height."
-            ),
-            passages=tuple(model_4_saved_case1),
-        ),
+        # PorousModelSpec(
+        #     name="model_4_saved_case_1",
+        #     description="Saved case 1 with two independent rectangular passages; " + size_text + ".",
+        #     passages=tuple(model_4),
+        # ),
     ]
-
 
 
 # =============================================================================
@@ -1456,44 +1253,31 @@ def build_base_problem(
     return flow, geom, ref, aero_solver
 
 
-def _spec_channel_height(spec: PassageSpec) -> float:
-    """Read rectangular channel height with legacy ``diameter_m`` fallback."""
-    for attr in ("channel_height_m", "height_m", "diameter_m"):
-        value = getattr(spec, attr, None)
-        if value is not None:
-            value = float(value)
-            if np.isfinite(value) and value > 0.0:
-                return value
-    raise ValueError(f"Passage {getattr(spec, 'name', '<unnamed>')!r} has no height.")
-
-
 def build_network_from_model(
     model: PorousModelSpec,
-    span_width: float | None = None,
+    span_width: float,
 ) -> IndependentPassageNetwork:
-    """Build a per-unit-span rectangular-channel network.
+    """Build the 2D rectangular network.
 
-    ``span_width`` is accepted only for compatibility with existing workflows
-    and is not used by the 2D rectangular-slot equations.
+    ``span_width`` is accepted for backward compatibility but is not used by
+    the per-unit-span hydraulic or transpiration equations.
     """
-    passages: list[IndependentPassage] = []
+    if span_width <= 0.0:
+        raise ValueError("span_width must be positive.")
 
+    passages: list[IndependentPassage] = []
     for spec in model.passages:
-        height = _spec_channel_height(spec)
+        height = float(spec.channel_height_m)
         passages.append(
             IndependentPassage(
                 name=spec.name,
                 pore1=Pore(spec.x1_frac, spec.side1, height),
                 pore2=Pore(spec.x2_frac, spec.side2, height),
-                chamber=Chamber(
-                    hydraulic_diameter=2.0 * height,
-                    area=height,  # flow area per unit span
-                ),
-                span_width=span_width,
+                chamber=Chamber(height=height),
+                span_width=float(span_width),
                 layout_kind=spec.layout_kind,
             )
         )
-
     return IndependentPassageNetwork(passages)
 
 
@@ -1623,26 +1407,22 @@ def build_passage_dataframe(
     geom: PanelGeometry,
     result: MultiPassageResult,
 ) -> pd.DataFrame:
-    """Build the per-passage rectangular-channel result table."""
-    rows: list[dict] = []
+    rows = []
 
     for passage_id, (passage, state) in enumerate(
-        zip(network.passages, result.passage_states), start=1
+        zip(network.passages, result.passage_states),
+        start=1,
     ):
         sp1 = passage.pore_surface_point(geom, passage.pore1)
         sp2 = passage.pore_surface_point(geom, passage.pore2)
-        patch1 = passage.opening_patch(geom, passage.pore1)
-        patch2 = passage.opening_patch(geom, passage.pore2)
-        height = passage.channel_height_m
-        q = float(state.Q)
 
         rows.append(
             {
                 "model_name": model.name,
                 "passage_id": passage_id,
                 "passage_name": passage.name,
-                "opening1_side": passage.pore1.side,
-                "opening2_side": passage.pore2.side,
+                "pore1_side": passage.pore1.side,
+                "pore2_side": passage.pore2.side,
                 "x1_frac": passage.pore1.x_frac,
                 "x2_frac": passage.pore2.x_frac,
                 "x1_surface_m": sp1.x,
@@ -1653,48 +1433,24 @@ def build_passage_dataframe(
                 "y1_over_c_surface": sp1.y / geom.chord,
                 "x2_over_c_surface": sp2.x / geom.chord,
                 "y2_over_c_surface": sp2.y / geom.chord,
-                "channel_height_m": height,
-                "hydraulic_diameter_m": 2.0 * height,
+                "channel_height_m": passage.chamber.height,
+                "flow_area_per_unit_span_m": passage.chamber.area,
+                "channel_planform_area_m2": passage.chamber.planform_area(
+                    passage.passage_length(geom)
+                ),
+                "hydraulic_diameter_m": passage.chamber.hydraulic_diameter,
+                # Compatibility column used by existing plotting scripts.
+                "pore_diameter_m": passage.pore1.height,
                 "passage_length_m": passage.passage_length(geom),
-                "opening1_length_m": patch1.opening_length_m,
-                "opening2_length_m": patch2.opening_length_m,
-                "opening1_normal_component": patch1.normal_component,
-                "opening2_normal_component": patch2.normal_component,
-                "flow_rate_per_unit_span_m2_s": q,
-                "abs_flow_rate_per_unit_span_m2_s": abs(q),
-                "mean_velocity_m_s": getattr(state, "mean_velocity_m_s", np.nan),
-                "equivalent_resistance_Pa_s_per_m2": state.Rs,
+                "q_per_unit_span_m2_s": state.Q,
+                "abs_q_per_unit_span_m2_s": abs(state.Q),
+                "Rprime_Pa_s_per_m2": state.Rs,
                 "dp_total_Pa": state.dp_total,
-                "reynolds_internal": state.reynolds_equivalent,
+                "reynolds_internal_equivalent": state.reynolds_equivalent,
                 "p1_Pa": state.p1,
                 "p2_Pa": state.p2,
-                "friction_factor_darcy": state.friction_factor,
+                "friction_factor": state.friction_factor,
                 "resistance_model": state.resistance_model,
-                "wall_shear_Pa": getattr(state, "wall_shear_pa", np.nan),
-                "wall_force_per_span_N_per_m": getattr(
-                    state, "wall_force_per_span_n_m", np.nan
-                ),
-                "pressure_force_per_span_N_per_m": getattr(
-                    state, "pressure_force_per_span_n_m", np.nan
-                ),
-                "force_balance_error_per_span_N_per_m": getattr(
-                    state, "force_balance_error_per_span_n_m", np.nan
-                ),
-                "internal_force_x_per_span_N_per_m": getattr(
-                    state, "internal_force_x_per_span_n_m", np.nan
-                ),
-                "internal_force_y_per_span_N_per_m": getattr(
-                    state, "internal_force_y_per_span_n_m", np.nan
-                ),
-                "internal_moment_per_span_N": getattr(
-                    state, "internal_moment_per_span_n", np.nan
-                ),
-                # Compatibility aliases for existing post-processing.
-                "pore_diameter_m": height,
-                "Q_m3_s": q,
-                "abs_Q_m3_s": abs(q),
-                "Rs_Pa_s_per_m3": state.Rs,
-                "reynolds_internal_equivalent": state.reynolds_equivalent,
             }
         )
 
@@ -1702,16 +1458,24 @@ def build_passage_dataframe(
 
 
 def representative_channel_height(model: PorousModelSpec) -> float:
-    heights = [_spec_channel_height(spec) for spec in model.passages]
-    return float(np.mean(heights)) if heights else float("nan")
+    """Return the mean rectangular channel height for summaries."""
+    values = [float(p.channel_height_m) for p in model.passages]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def representative_channel_width(model: PorousModelSpec) -> float:
+    """Compatibility value: the active model is per unit span."""
+    del model
+    return 1.0
 
 
 def representative_pore_diameter(model: PorousModelSpec) -> float:
-    """Compatibility alias: legacy diameter now means channel height."""
+    """Compatibility alias returning rectangular channel height."""
     return representative_channel_height(model)
 
 
 def nan_if_not_converged(value: float, converged: bool) -> float:
+    """Return value for converged cases and NaN for non-converged cases."""
     return float(value) if converged else float("nan")
 
 
@@ -1722,13 +1486,19 @@ def make_nonconverged_summary_row(
     porous_result: MultiPassageResult,
     elapsed_seconds: float,
 ) -> dict:
+    """Summary row used when coupling did not converge.
+
+    The requested behaviour is: if a porous case does not converge, report NaN
+    for the porous aerodynamic/internal-flow quantities and do not treat the
+    unconverged values as valid results.
+    """
     nan = float("nan")
-    height = representative_channel_height(model)
     return {
         "model_name": model.name,
         "description": model.description,
-        "channel_height_m": height,
-        "pore_diameter_m": height,  # compatibility
+        "reference_unit_span_m": 1.0,
+        "channel_height_m": representative_channel_height(model),
+        "pore_diameter_m": representative_channel_height(model),
         "num_independent_passages": len(model.passages),
         "reynolds_external": REYNOLDS_EXTERNAL,
         "v_inf_m_s": flow.v_inf,
@@ -1736,12 +1506,6 @@ def make_nonconverged_summary_row(
         "solid_CL": solid_result.CL,
         "solid_CD": solid_result.CD,
         "solid_CM": solid_result.CM,
-        "external_wall_CL": nan,
-        "external_wall_CD": nan,
-        "external_wall_CM": nan,
-        "internal_channel_CL": nan,
-        "internal_channel_CD": nan,
-        "internal_channel_CM": nan,
         "porous_CL": nan,
         "porous_CD": nan,
         "porous_CM": nan,
@@ -1749,17 +1513,12 @@ def make_nonconverged_summary_row(
         "delta_CD": nan,
         "delta_CM": nan,
         "gain_percent_vs_solid_panel": nan,
-        "max_abs_flow_rate_per_unit_span_m2_s": nan,
-        "sum_abs_flow_rate_per_unit_span_m2_s": nan,
-        "max_abs_Q_m3_s": nan,  # compatibility
-        "sum_abs_Q_m3_s": nan,
+        "max_abs_q_per_unit_span_m2_s": nan,
+        "sum_abs_q_per_unit_span_m2_s": nan,
         "max_dp_total_Pa": nan,
-        "max_internal_reynolds": nan,
         "max_internal_reynolds_equivalent": nan,
-        "max_wall_shear_Pa": nan,
         "max_vn_m_s": nan,
         "max_vn_over_vinf": nan,
-        "boundary_flux_per_unit_span_m2_s": nan,
         "coupling_converged": False,
         "coupling_iterations": porous_result.iterations,
         "elapsed_seconds": elapsed_seconds,
@@ -1773,14 +1532,6 @@ def export_surface_data(
     porous_result: MultiPassageResult,
 ) -> None:
     aero = porous_result.aero_result
-    opening_fraction = np.asarray(
-        getattr(porous_result, "opening_fraction", np.zeros(geom.num_pan)),
-        dtype=float,
-    )
-    wall_fraction = np.asarray(
-        getattr(porous_result, "wall_fraction", np.ones(geom.num_pan)),
-        dtype=float,
-    )
 
     df = pd.DataFrame(
         {
@@ -1795,13 +1546,10 @@ def export_surface_data(
             "YC_over_c": geom.YC / geom.chord,
             "panel_length_m": geom.S,
             "porous_Vt_m_s": aero.Vt,
-            "porous_normal_velocity_m_s": aero.normal_velocity,
             "porous_Cp": aero.Cp,
             "solid_Vt_m_s": solid_result.Vt,
             "solid_Cp": solid_result.Cp,
             "normal_transpiration_m_s": porous_result.normal_transpiration,
-            "opening_fraction": opening_fraction,
-            "solid_wall_fraction": wall_fraction,
         }
     )
 
@@ -1819,26 +1567,25 @@ def build_model_summary_row(
 ) -> dict:
     if not porous_result.converged:
         return make_nonconverged_summary_row(
-            model, flow, solid_result, porous_result, elapsed_seconds
+            model=model,
+            flow=flow,
+            solid_result=solid_result,
+            porous_result=porous_result,
+            elapsed_seconds=elapsed_seconds,
         )
 
     aero = porous_result.aero_result
-    q_abs = [abs(float(state.Q)) for state in porous_result.passage_states]
-    dp_values = [float(state.dp_total) for state in porous_result.passage_states]
-    re_values = [
-        float(state.reynolds_equivalent) for state in porous_result.passage_states
-    ]
-    shear_values = [
-        float(getattr(state, "wall_shear_pa", np.nan))
-        for state in porous_result.passage_states
-    ]
-    height = representative_channel_height(model)
+
+    q_abs = [abs(float(s.Q)) for s in porous_result.passage_states]
+    dp_values = [float(s.dp_total) for s in porous_result.passage_states]
+    re_values = [float(s.reynolds_equivalent) for s in porous_result.passage_states]
 
     return {
         "model_name": model.name,
         "description": model.description,
-        "channel_height_m": height,
-        "pore_diameter_m": height,  # compatibility
+        "reference_unit_span_m": 1.0,
+        "channel_height_m": representative_channel_height(model),
+        "pore_diameter_m": representative_channel_height(model),
         "num_independent_passages": len(model.passages),
         "reynolds_external": REYNOLDS_EXTERNAL,
         "v_inf_m_s": flow.v_inf,
@@ -1846,12 +1593,6 @@ def build_model_summary_row(
         "solid_CL": solid_result.CL,
         "solid_CD": solid_result.CD,
         "solid_CM": solid_result.CM,
-        "external_wall_CL": aero.external_wall_CL,
-        "external_wall_CD": aero.external_wall_CD,
-        "external_wall_CM": aero.external_wall_CM,
-        "internal_channel_CL": aero.internal_channel_CL,
-        "internal_channel_CD": aero.internal_channel_CD,
-        "internal_channel_CM": aero.internal_channel_CM,
         "porous_CL": aero.CL,
         "porous_CD": aero.CD,
         "porous_CM": aero.CM,
@@ -1859,23 +1600,17 @@ def build_model_summary_row(
         "delta_CD": aero.CD - solid_result.CD,
         "delta_CM": aero.CM - solid_result.CM,
         "gain_percent_vs_solid_panel": 100.0 * (aero.CL / solid_result.CL - 1.0),
-        "max_abs_flow_rate_per_unit_span_m2_s": max(q_abs) if q_abs else 0.0,
-        "sum_abs_flow_rate_per_unit_span_m2_s": sum(q_abs),
-        "max_abs_Q_m3_s": max(q_abs) if q_abs else 0.0,  # compatibility
-        "sum_abs_Q_m3_s": sum(q_abs),
+        "max_abs_q_per_unit_span_m2_s": max(q_abs) if q_abs else 0.0,
+        "sum_abs_q_per_unit_span_m2_s": sum(q_abs),
         "max_dp_total_Pa": max(dp_values) if dp_values else 0.0,
-        "max_internal_reynolds": max(re_values) if re_values else 0.0,
         "max_internal_reynolds_equivalent": max(re_values) if re_values else 0.0,
-        "max_wall_shear_Pa": np.nanmax(shear_values) if shear_values else 0.0,
         "max_vn_m_s": porous_result.max_vn,
         "max_vn_over_vinf": porous_result.max_vn_over_vinf,
-        "boundary_flux_per_unit_span_m2_s": getattr(
-            porous_result, "boundary_flux_per_unit_span_m2_s", np.nan
-        ),
         "coupling_converged": porous_result.converged,
         "coupling_iterations": porous_result.iterations,
         "elapsed_seconds": elapsed_seconds,
     }
+
 
 
 def _alpha_directory_name(alpha_deg: float) -> str:
@@ -1911,6 +1646,11 @@ def run_porous_aoa_sweep_for_model(
     paraview_cases: list[dict[str, Path]] = []
     paraview_alphas: list[float] = []
 
+    # Every AoA is solved as an independent physical case.  Do not carry the
+    # transpiration field from one angle into the next: near a hydraulic branch
+    # change, the previous-angle field can place the fixed-point iteration on an
+    # oscillatory/non-convergent path even though a zero-flow start converges.
+
     if export_paraview:
         if paraview_output_dir is None:
             raise ValueError("paraview_output_dir is required when export_paraview=True.")
@@ -1939,12 +1679,14 @@ def run_porous_aoa_sweep_for_model(
             span_width=SPAN_WIDTH,
         )
 
+        # Primary solve: cold start for this AoA.  This reproduces the original
+        # sweep behaviour in which each angle is independent.
         coupled_i = MultiPassageCoupledSolver(
             aero_solver=aero_solver_i,
             network=network_i,
             coupling=coupling,
             limits=limits,
-        ).solve(verbose=False)
+        ).solve(verbose=False, initial_vn=None)
 
         if coupled_i.converged and export_paraview and paraview_output_dir is not None:
             alpha_dir = paraview_output_dir / _alpha_directory_name(alpha)
@@ -1965,48 +1707,28 @@ def run_porous_aoa_sweep_for_model(
             paraview_cases.append(exported_files)
             paraview_alphas.append(alpha)
 
-        channel_height = representative_channel_height(model)
         if coupled_i.converged:
-            aero_i = coupled_i.aero_result
-            q_values = [abs(float(state.Q)) for state in coupled_i.passage_states]
             row = {
                 "alpha_deg": alpha,
-                "channel_height_m": channel_height,
-                "pore_diameter_m": channel_height,  # compatibility
-                "external_wall_CL": float(aero_i.external_wall_CL),
-                "external_wall_CD": float(aero_i.external_wall_CD),
-                "external_wall_CM": float(aero_i.external_wall_CM),
-                "internal_channel_CL": float(aero_i.internal_channel_CL),
-                "internal_channel_CD": float(aero_i.internal_channel_CD),
-                "internal_channel_CM": float(aero_i.internal_channel_CM),
-                "porous_CL": float(aero_i.CL),
-                "porous_CD": float(aero_i.CD),
-                "porous_CM": float(aero_i.CM),
+                "reference_unit_span_m": 1.0,
+                "channel_height_m": representative_channel_height(model),
+                "pore_diameter_m": representative_channel_height(model),
+                "porous_CL": float(coupled_i.aero_result.CL),
+                "porous_CD": float(coupled_i.aero_result.CD),
+                "porous_CM": float(coupled_i.aero_result.CM),
                 "solid_panel_CL": float(solid_i.CL),
                 "solid_panel_CD": float(solid_i.CD),
                 "solid_panel_CM": float(solid_i.CM),
-                "delta_CL": float(aero_i.CL - solid_i.CL),
-                "delta_CD": float(aero_i.CD - solid_i.CD),
-                "delta_CM": float(aero_i.CM - solid_i.CM),
-                "max_abs_flow_rate_per_unit_span_m2_s": max(q_values),
-                "sum_abs_flow_rate_per_unit_span_m2_s": sum(q_values),
-                "max_abs_Q_m3_s": max(q_values),  # compatibility
-                "sum_abs_Q_m3_s": sum(q_values),
-                "max_dp_total_Pa": max(
-                    float(state.dp_total) for state in coupled_i.passage_states
-                ),
-                "max_internal_reynolds": max(
-                    float(state.reynolds_equivalent)
-                    for state in coupled_i.passage_states
-                ),
+                "delta_CL": float(coupled_i.aero_result.CL - solid_i.CL),
+                "delta_CD": float(coupled_i.aero_result.CD - solid_i.CD),
+                "delta_CM": float(coupled_i.aero_result.CM - solid_i.CM),
+                "max_abs_q_per_unit_span_m2_s": max(abs(float(s.Q)) for s in coupled_i.passage_states),
+                "sum_abs_q_per_unit_span_m2_s": sum(abs(float(s.Q)) for s in coupled_i.passage_states),
+                "max_dp_total_Pa": max(float(s.dp_total) for s in coupled_i.passage_states),
                 "max_internal_reynolds_equivalent": max(
-                    float(state.reynolds_equivalent)
-                    for state in coupled_i.passage_states
+                    float(s.reynolds_equivalent) for s in coupled_i.passage_states
                 ),
                 "max_vn_m_s": float(coupled_i.max_vn),
-                "boundary_flux_per_unit_span_m2_s": float(
-                    coupled_i.boundary_flux_per_unit_span_m2_s
-                ),
                 "coupling_converged": True,
                 "coupling_iterations": int(coupled_i.iterations),
                 "max_vn_over_vinf": float(coupled_i.max_vn_over_vinf),
@@ -2015,14 +1737,9 @@ def run_porous_aoa_sweep_for_model(
             nan = float("nan")
             row = {
                 "alpha_deg": alpha,
-                "channel_height_m": channel_height,
-                "pore_diameter_m": channel_height,
-                "external_wall_CL": nan,
-                "external_wall_CD": nan,
-                "external_wall_CM": nan,
-                "internal_channel_CL": nan,
-                "internal_channel_CD": nan,
-                "internal_channel_CM": nan,
+                "reference_unit_span_m": 1.0,
+                "channel_height_m": representative_channel_height(model),
+                "pore_diameter_m": representative_channel_height(model),
                 "porous_CL": nan,
                 "porous_CD": nan,
                 "porous_CM": nan,
@@ -2032,15 +1749,11 @@ def run_porous_aoa_sweep_for_model(
                 "delta_CL": nan,
                 "delta_CD": nan,
                 "delta_CM": nan,
-                "max_abs_flow_rate_per_unit_span_m2_s": nan,
-                "sum_abs_flow_rate_per_unit_span_m2_s": nan,
-                "max_abs_Q_m3_s": nan,
-                "sum_abs_Q_m3_s": nan,
+                "max_abs_q_per_unit_span_m2_s": nan,
+                "sum_abs_q_per_unit_span_m2_s": nan,
                 "max_dp_total_Pa": nan,
-                "max_internal_reynolds": nan,
                 "max_internal_reynolds_equivalent": nan,
                 "max_vn_m_s": nan,
-                "boundary_flux_per_unit_span_m2_s": nan,
                 "coupling_converged": False,
                 "coupling_iterations": int(coupled_i.iterations),
                 "max_vn_over_vinf": nan,
@@ -2265,10 +1978,10 @@ def run_one_model(
         print("[ParaView] Exporting all AoA sweep cases for ParaView...")
 
     if aoa_sweep_diameters is None:
-        aoa_sweep_diameters = tuple(float(d) for d in AOA_SWEEP_PORE_DIAMETERS)
+        aoa_sweep_diameters = tuple(float(d) for d in AOA_SWEEP_CHANNEL_HEIGHTS)
 
-    # Existing configuration names are retained, but these values are rectangular
-    # channel heights rather than circular pore diameters.
+    # All models use the configured rectangular-channel-height sweep.
+    # Each model is rebuilt for every height in AOA_SWEEP_CHANNEL_HEIGHTS.
     # Build all sweep models first.
     sweep_models = []
 
@@ -2277,7 +1990,7 @@ def run_one_model(
 
         matching = [
             candidate
-            for candidate in build_model_specs(geom=geom, diameter_m=diameter_m)
+            for candidate in build_model_specs(geom=geom, channel_height_m=diameter_m)
             if candidate.name == model.name
         ]
 
@@ -2289,7 +2002,8 @@ def run_one_model(
         sweep_models.append(matching[0])
 
 
-    # ParaView AoA sweep export is written for only one channel height.
+    # ParaView AoA sweep export should be written for only one diameter.
+    # Use the first AoA sweep diameter as the ParaView reference diameter.
     paraview_diameter_m = (
         float(aoa_sweep_diameters[0])
         if aoa_sweep_diameters
@@ -2300,7 +2014,7 @@ def run_one_model(
     for i, sm in enumerate(sweep_models, start=1):
         print(
             f"  {i}: {sm.name}, "
-            f"h={representative_channel_height(sm):.6e} m"
+            f"H={representative_channel_height(sm):.6e} m"
         )
 
 
@@ -2308,7 +2022,7 @@ def run_one_model(
     sweep_frames: list[pd.DataFrame] = []
 
     for sweep_model in sweep_models:
-        diameter_m = representative_channel_height(sweep_model)
+        diameter_m = representative_pore_diameter(sweep_model)
         print(f"[Sweep] {sweep_model.name}, channel height = {diameter_m:.6e} m")
 
         export_paraview_for_this_diameter = (
