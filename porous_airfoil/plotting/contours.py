@@ -73,7 +73,7 @@ from ..porous import (
 # USER SETTINGS
 # =============================================================================
 FINAL_CONTOUR_AOA_DEG = 10.0
-FINAL_CONTOUR_PORE_DIAMETER_M = 0.0090
+FINAL_CONTOUR_PORE_DIAMETER_M = 0.0080
 
 FINAL_CONTOUR_MODEL_NAMES = (
     "model_1_4_chordwise",

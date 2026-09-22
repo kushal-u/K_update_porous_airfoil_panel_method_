@@ -1,2 +1,0 @@
-model_name,model_label,aoa_deg,pore_diameter_m,solid_CL,solid_CM,porous_CL,porous_CM,delta_CL,delta_CM,gain_percent_vs_solid_panel,coupling_converged,coupling_iterations,max_vn_m_s,max_vn_over_vinf,elapsed_seconds
-model_1_4_chordwise,Horizontal,10.0,0.009,1.2570977745306897,-0.02320849047056599,1.6839348170206458,-0.0782932453868395,0.42683704248995613,-0.055084754916273515,33.95416419771378,True,12,13.637034314692697,1.8561518928331728,0.12175008099984552

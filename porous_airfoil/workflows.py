@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
 from .config import (
     AIRFOIL_NAME,
@@ -54,6 +56,35 @@ from .porous import (
     run_porous_aoa_sweep_for_model,
     run_xfoil_aoa_sweep_for_case,
 )
+
+def plot_sweep_with_gaps(sweep_df: pd.DataFrame, output_dir: Path) -> None:
+    """Keep every alpha row: NaNs break lines rather than bridging failures."""
+    fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    for height, frame in sweep_df.groupby("channel_height_m", sort=True):
+        frame = frame.sort_values("alpha_deg")
+        valid = frame["coupling_converged"].fillna(False).astype(bool).to_numpy()
+        for ax, coefficient in zip(axes, ("CL", "CD", "CM")):
+            values = frame[f"porous_{coefficient}"].to_numpy(dtype=float).copy()
+            values[~valid] = np.nan
+            ax.plot(frame["alpha_deg"], values, marker="o", markersize=3,
+                    label=f"Porous H={height*1000:g} mm")
+    reference = sweep_df.drop_duplicates("alpha_deg").sort_values("alpha_deg")
+    for ax, coefficient in zip(axes, ("CL", "CD", "CM")):
+        ax.plot(reference["alpha_deg"], reference[f"solid_panel_{coefficient}"],
+                "k--", label="Solid panel")
+        if f"xfoil_{coefficient}" in reference:
+            ax.plot(reference["alpha_deg"], reference[f"xfoil_{coefficient}"],
+                    ":", color="0.5", label="Inviscid XFOIL")
+        ax.set_ylabel("Pressure CD" if coefficient == "CD" else coefficient)
+        ax.grid(alpha=0.25)
+    axes[0].legend(fontsize=8)
+    axes[-1].set_xlabel("Angle of attack [deg]")
+    failed = int((~sweep_df["coupling_converged"].fillna(False).astype(bool)).sum())
+    fig.suptitle(f"{failed} invalid/unconverged cases omitted; lines break at missing values")
+    fig.tight_layout()
+    fig.savefig(output_dir / "aoa_sweep_with_gaps.png", dpi=200)
+    plt.close(fig)
+
 
 VALID_MODEL_NAMES = {
     "all",
@@ -303,22 +334,13 @@ def run_sweep_for_model(
     sweep_df.to_csv(csv_path, index=False)
     print(f"[CSV Saved] {csv_path}")
 
-    if "coupling_converged" in sweep_df.columns:
-        failed = sweep_df.loc[~sweep_df["coupling_converged"].astype(bool)]
-        if not failed.empty:
-            failed_cases = ", ".join(
-                f"(alpha={row.alpha_deg:g} deg, "
-                f"H={1000.0 * row.channel_height_m:.1f} mm)"
-                for row in failed.itertuples(index=False)
-            )
-            raise RuntimeError(
-                "AoA sweep contains non-converged porous cases after the "
-                f"nonlinear coupling solve: {failed_cases}. The CSV was saved, "
-                "but "
-                "the plot was not written because joining invalid points would "
-                "be misleading."
-            )
-    plot_aoa_sweep_comparison(sweep_df=sweep_df, output_dir=model_dir)
+    failed = sweep_df.loc[~sweep_df["coupling_converged"].fillna(False).astype(bool)]
+    # Rewrite even when empty, so an old failure report is not left behind.
+    failed.to_csv(model_dir / "failed_cases.csv", index=False)
+    if not failed.empty:
+        print(f"[Warning] {len(failed)} cases invalid or unconverged in {base_model.name}. "
+              "Results remain NaN; see failed_cases.csv. Continuing.")
+    plot_sweep_with_gaps(sweep_df=sweep_df, output_dir=model_dir)
     return sweep_df
 
 
@@ -384,19 +406,34 @@ def run_all_workflows() -> dict[str, object]:
     print("\n[1/5] Running angle-of-attack sweep")
     results["aoa_sweep"] = run_aoa_sweep()
 
-    print("\n[2/5] Creating aerodynamic plots")
-    results["aero_plots"] = run_aerodynamic_plots()
-
-    print("\n[3/5] Creating geometry plots")
-    results["geometry"] = run_geometry_plots()
-
-    print("\n[4/5] Creating contour plots")
-    results["contours"] = run_contour_plots()
-
-    print("\n[5/5] Creating streamline plots")
-    results["streamlines"] = run_streamline_plots()
+    complete = bool(results["aoa_sweep"]["coupling_converged"].fillna(False).all())
+    stages = [
+        ("aero_plots", run_aerodynamic_plots),
+        ("geometry", run_geometry_plots),
+        ("contours", run_contour_plots),
+        ("streamlines", run_streamline_plots),
+    ]
+    stage_status = []
+    for number, (name, operation) in enumerate(stages, start=2):
+        print(f"\n[{number}/5] Creating {name}")
+        if name == "aero_plots" and not complete:
+            message = "Using verified aoa_sweep_with_gaps.png plots; legacy bulk plotter skipped for incomplete data."
+            print(f"[Plot] {message}")
+            results[name] = {"status": "skipped", "message": message}
+        else:
+            try:
+                results[name] = operation()
+            except (ValueError, RuntimeError) as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                print(f"[Stage failed] {name}: {message}. Continuing to the next stage.")
+                results[name] = {"status": "failed", "message": message}
+        result = results[name]
+        status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+        message = result.get("message", "") if isinstance(result, dict) else ""
+        stage_status.append({"stage": name, "status": status, "message": message})
+    pd.DataFrame(stage_status).to_csv(Path(OUTPUT_ROOT) / "pipeline_stage_status.csv", index=False)
 
     print("=" * 80)
-    print("COMPLETE POROUS-AIRFOIL PIPELINE FINISHED")
+    print("PIPELINE FINISHED — inspect failure and stage-status CSVs")
     print("=" * 80)
     return results

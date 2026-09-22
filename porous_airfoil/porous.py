@@ -264,9 +264,15 @@ class IndependentPassage:
 
         straight = np.hypot(sp2.x - sp1.x, sp2.y - sp1.y)
 
-        # Model 1 uses constant-y horizontal, straight internal channels.
-        # Do not add extra endpoint-thickness length for this geometry.
-        if self.layout_kind in {"internal_horizontal", "internal_chordwise_horizontal"}:
+        # Straight in-plane channels use the direct surface-to-surface centreline
+        # distance. For a lower-to-upper perpendicular passage on a symmetric
+        # airfoil, this is exactly the local thickness; adding t1/2 + t2/2 would
+        # double-count the same geometric distance.
+        if self.layout_kind in {
+            "internal_horizontal",
+            "internal_chordwise_horizontal",
+            "perpendicular",
+        }:
             return max(float(straight), 1e-6)
 
         return max(float(straight + 0.5 * t1 + 0.5 * t2), 1e-6)
@@ -340,96 +346,132 @@ class IndependentPassage:
         )
 
 
-    def _surface_patch_weights(
-        self,
-        geom: PanelGeometry,
-        pore: Pore,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return panel IDs and exact opening-overlap lengths for one pore.
+    def _opening_segments(
+        self, geom: PanelGeometry, pore: Pore,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Intersect the channel strip with the polygonal airfoil surface.
 
-        The physical pore opening is exactly ``H`` along the surface. Partial
-        end panels receive fractional overlap weights. This removes the old
-        mesh-dependent rules based on a minimum panel count or ``3H`` patch.
+        H is measured perpendicular to the centreline. Each returned segment
+        is [t0,t1] within its original panel, with 0 <= t0 < t1 <= 1.
+        Select the connected opening containing this end of the centreline;
+        do not confuse it with the opening at the other end of the channel.
+        Geometry is exact for the supplied straight-panel boundary.
         """
-        if pore.side == "upper":
-            candidate_ids = np.asarray(geom.upper_panel_ids, dtype=int)
-        else:
-            candidate_ids = np.asarray(geom.lower_panel_ids, dtype=int)
+        cache = getattr(self, "_opening_cache", None)
+        if cache is None or cache[0] is not geom:
+            cache = (geom, {})
+            self._opening_cache = cache
+        key = (pore, self.pore1, self.pore2, self.chamber.height)
+        if key in cache[1]:
+            return cache[1][key]
+        if not np.isclose(pore.height, self.chamber.height):
+            raise ValueError("Opening and channel heights must agree.")
+        a = self.pore_surface_point(geom, self.pore1)
+        b = self.pore_surface_point(geom, self.pore2)
+        origin = np.array([a.x, a.y])
+        direction = np.array([b.x - a.x, b.y - a.y])
+        length = np.linalg.norm(direction)
+        if length <= 0.0:
+            raise ValueError("Channel endpoints must be distinct.")
+        direction /= length
+        transverse = np.array([-direction[1], direction[0]])
+        points = np.column_stack((geom.XB, geom.YB))
+        z = (points - origin) @ transverse
+        half_height = 0.5 * self.chamber.height
+        dz = np.diff(z)
+        lo = np.zeros(geom.num_pan)
+        hi = np.ones(geom.num_pan)
+        nonparallel = np.abs(dz) > 1e-14 * max(geom.chord, self.chamber.height)
+        t_a = np.zeros_like(lo)
+        t_b = np.zeros_like(lo)
+        t_a[nonparallel] = (-half_height-z[:-1][nonparallel])/dz[nonparallel]
+        t_b[nonparallel] = ( half_height-z[:-1][nonparallel])/dz[nonparallel]
+        lo[nonparallel] = np.maximum(0.0, np.minimum(t_a, t_b)[nonparallel])
+        hi[nonparallel] = np.minimum(1.0, np.maximum(t_a, t_b)[nonparallel])
+        hi[~nonparallel & (np.abs(z[:-1]) > half_height)] = -1.0
+        active = (hi-lo)*geom.S > 1e-14*geom.chord
+        ids = np.flatnonzero(active)
+        if not ids.size:
+            raise ValueError(f"{self.name}: channel does not open on the boundary.")
+        # Components in cyclic panel order, joining only across covered vertices.
+        groups = [[int(ids[0])]]
+        for i in ids[1:]:
+            prev = groups[-1][-1]
+            if i == prev+1 and hi[prev] >= 1.0-1e-12 and lo[i] <= 1e-12:
+                groups[-1].append(int(i))
+            else:
+                groups.append([int(i)])
+        if (len(groups) > 1 and groups[0][0] == 0
+                and groups[-1][-1] == geom.num_pan-1
+                and lo[0] <= 1e-12 and hi[-1] >= 1.0-1e-12):
+            groups[0] = groups[-1]+groups[0]
+            groups.pop()
+        target = self.pore_surface_point(geom, pore)
+        target_xy = np.array([target.x, target.y])
+        def distance(group):
+            ii = np.asarray(group)
+            edges = points[ii+1]-points[ii]
+            t = np.sum((target_xy-points[ii])*edges, axis=1)/geom.S[ii]**2
+            t = np.clip(t, lo[ii], hi[ii])
+            return np.min(np.linalg.norm(points[ii]+t[:, None]*edges-target_xy, axis=1))
+        selected = min(groups, key=distance)
+        if distance(selected) > 1e-5*geom.chord:
+            raise ValueError(f"{self.name}: no opening contains the specified endpoint.")
+        ii = np.asarray(selected, dtype=int)
+        # A physical end must lie on its declared surface. Openings wrapping
+        # around LE/TE need explicit geometry, rather than silently shifting them.
+        side_ids = geom.upper_panel_ids if pore.side == "upper" else geom.lower_panel_ids
+        if not np.all(np.isin(ii, side_ids)):
+            raise ValueError(f"{self.name}: opening wraps around LE/TE; revise channel geometry.")
+        result = (ii, lo[ii].copy(), hi[ii].copy())
+        cache[1][key] = result
+        return result
 
-        if candidate_ids.size == 0:
-            raise RuntimeError(f"No panels available on the {pore.side} surface.")
+    def _surface_patch_weights(
+        self, geom: PanelGeometry, pore: Pore,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility API: actual panel intersection lengths, not fitted weights.
 
-        # On each individual airfoil side, x is monotonic from LE to TE.
-        order = np.argsort(geom.XC[candidate_ids])
-        ids = candidate_ids[order]
-        panel_lengths = np.asarray(geom.S[ids], dtype=float)
-
-        edges = np.concatenate([[0.0], np.cumsum(panel_lengths)])
-        mids = 0.5 * (edges[:-1] + edges[1:])
-
-        surface_point = self.pore_surface_point(geom, pore)
-        s_center = float(
-            np.interp(
-                surface_point.x,
-                geom.XC[ids],
-                mids,
-                left=mids[0],
-                right=mids[-1],
-            )
-        )
-
-        opening = float(pore.height)
-        total_surface_length = float(edges[-1])
-        if opening > total_surface_length:
-            raise ValueError(
-                f"{self.name}: pore opening H={opening:.6e} m exceeds the "
-                f"available {pore.side} surface length {total_surface_length:.6e} m."
-            )
-
-        s_start = s_center - 0.5 * opening
-        s_end = s_center + 0.5 * opening
-
-        # Shift, rather than truncate, an opening that touches a side endpoint.
-        if s_start < 0.0:
-            s_end -= s_start
-            s_start = 0.0
-        if s_end > total_surface_length:
-            s_start -= s_end - total_surface_length
-            s_end = total_surface_length
-        s_start = max(0.0, s_start)
-
-        overlap = np.maximum(
-            0.0,
-            np.minimum(edges[1:], s_end) - np.maximum(edges[:-1], s_start),
-        )
-        active = overlap > 1.0e-15
-        selected_ids = ids[active]
-        selected_overlap = overlap[active]
-
-        actual_opening = float(np.sum(selected_overlap))
-        if not np.isclose(actual_opening, opening, rtol=0.0, atol=1.0e-10):
-            raise RuntimeError(
-                f"{self.name}: surface patch length {actual_opening:.6e} m does "
-                f"not match H={opening:.6e} m."
-            )
-
-        return selected_ids, selected_overlap
-
+        Used only for conservative transfer of channel flow to panel velocities.
+        Pressure is integrated independently by _area_average_pressure_at_pore.
+        """
+        ids, t0, t1 = self._opening_segments(geom, pore)
+        return ids, (t1-t0)*geom.S[ids]
 
     def _area_average_pressure_at_pore(
-        self,
-        geom: PanelGeometry,
-        pore: Pore,
-        panel_pressures: np.ndarray,
-        min_panels: int = 0,
+        self, geom: PanelGeometry, pore: Pore,
+        panel_pressures: np.ndarray, min_panels: int = 0,
     ) -> float:
-        """Length-average pressure over the exact rectangular pore opening."""
+        """Integrate reconstructed p(s) over the geometrically resolved opening.
+
+        p(s) is piecewise linear through surface panel-centre pressures, with
+        constant continuation over the half-panels at the surface endpoints.
+        Integration splits at every interpolation knot, so it is exact for
+        this reconstruction. Accuracy of physical pressure still depends on
+        panel resolution and the aerodynamic model. No overlap-weighted mean
+        of piecewise-constant panel pressures is used.
+        """
         del min_panels
-        ids, overlap = self._surface_patch_weights(geom=geom, pore=pore)
-        return float(
-            np.sum(panel_pressures[ids] * overlap)
-            / max(np.sum(overlap), 1.0e-16)
-        )
+        pressures = np.asarray(panel_pressures, dtype=float)
+        if pressures.shape != (geom.num_pan,) or not np.all(np.isfinite(pressures)):
+            raise ValueError("Panel pressures must be finite and match the panel count.")
+        ids, t0, t1 = self._opening_segments(geom, pore)
+        edges = np.concatenate(([0.0], np.cumsum(geom.S)))
+        centres = 0.5*(edges[:-1]+edges[1:])
+        side = geom.upper_panel_ids if pore.side == "upper" else geom.lower_panel_ids
+        side = np.sort(side)
+        knots = centres[side]
+        values = pressures[side]
+        integral = 0.0
+        opening_length = 0.0
+        for i, left, right in zip(ids, t0, t1):
+            start = edges[i]+left*geom.S[i]
+            end = edges[i]+right*geom.S[i]
+            x = np.concatenate(([start], knots[(knots > start) & (knots < end)], [end]))
+            y = np.interp(x, knots, values)
+            integral += float(np.sum(0.5*(y[:-1]+y[1:])*np.diff(x)))
+            opening_length += end-start
+        return integral/opening_length
 
 
     def solve(
@@ -439,7 +481,7 @@ class IndependentPassage:
         flow: FlowConfig,
     ) -> PassageState:
         """
-        Solve one internal channel using surface-patch averaged pore pressures.
+        Solve one internal channel using pressure integrated over its actual openings.
         """
         p1 = self._area_average_pressure_at_pore(
             geom=geom,
@@ -484,7 +526,7 @@ class IndependentPassage:
         geom: PanelGeometry,
         state: PassageState,
     ) -> np.ndarray:
-        """Map q' [m^2/s] to panel-normal velocity over an opening of length H.
+        """Map q' [m^2/s] over the actual channel/surface intersection.
 
         The panel-average values conserve flow exactly:
 
@@ -524,6 +566,23 @@ class IndependentPassageNetwork:
     def validate_geometry(self, geom: PanelGeometry, limits: GeometryLimits) -> None:
         for passage in self.passages:
             passage.validate_geometry(geom, limits)
+
+        # Check real opening intervals, including partial panels. Centre
+        # distances alone cannot detect oblique rectangular-opening overlap.
+        openings = []
+        for passage in self.passages:
+            for label, pore in (("pore1", passage.pore1), ("pore2", passage.pore2)):
+                ids, t0, t1 = passage._opening_segments(geom, pore)
+                intervals = {int(i): (float(a), float(b)) for i, a, b in zip(ids, t0, t1)}
+                for previous_name, previous in openings:
+                    for i in intervals.keys() & previous.keys():
+                        overlap = min(intervals[i][1], previous[i][1])-max(intervals[i][0], previous[i][0])
+                        if overlap*geom.S[i] > 1e-12*geom.chord:
+                            raise ValueError(
+                                f"Actual rectangular openings overlap: {previous_name} "
+                                f"and {passage.name}:{label}. Revise the channel layout."
+                            )
+                openings.append((f"{passage.name}:{label}", intervals))
 
         pore_refs: list[tuple[str, Pore, SurfacePoint]] = []
         for passage in self.passages:
@@ -634,7 +693,6 @@ class MultiPassageCoupledSolver:
         geom = self.aero_solver.geom
         flow = self.aero_solver.flow
 
-        self.network.validate_geometry(geom, self.limits)
 
         n_passages = len(self.network.passages)
         if initial_vn is None:
@@ -653,6 +711,20 @@ class MultiPassageCoupledSolver:
         last_finite_aero = self.aero_solver.solve(
             normal_transpiration=starting_vn
         )
+        try:
+            self.network.validate_geometry(geom, self.limits)
+        except ValueError as exc:
+            return MultiPassageResult(
+                aero_result=last_finite_aero, passage_states=[],
+                normal_transpiration=starting_vn, converged=False,
+                iterations=0, max_vn=float("nan"), max_vn_over_vinf=float("nan"),
+                coupling_status="invalid_geometry", solver_message=str(exc),
+            )
+        residual_norm = float("nan")
+        floating_point_resolution = float("nan")
+        solver_success = False
+        solver_message = ""
+        coupling_status = "not_converged"
         last_finite_pressures = self.aero_solver.panel_pressures(last_finite_aero)
         last_finite_states = self.network.solve(
             geom=geom,
@@ -762,6 +834,8 @@ class MultiPassageCoupledSolver:
                 method="hybr",
                 options={"maxfev": int(self.coupling.max_iter)},
             )
+            solver_success = bool(nonlinear_result.success)
+            solver_message = str(nonlinear_result.message).replace("\n", " ")
             final_q_dimensionless = np.asarray(
                 nonlinear_result.x,
                 dtype=float,
@@ -785,9 +859,8 @@ class MultiPassageCoupledSolver:
                 not numerical_failure
                 and residual_resolved
             )
-            final_iteration = int(
-                getattr(nonlinear_result, "nfev", evaluation_count)
-            )
+            final_iteration = evaluation_count
+            coupling_status = "converged" if converged else "not_converged"
 
             if verbose:
                 print(
@@ -800,6 +873,9 @@ class MultiPassageCoupledSolver:
         except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
             converged = False
             numerical_failure = True
+            coupling_status = "numerical_failure"
+            solver_message = f"{type(exc).__name__}: {exc}"
+            residual_norm = float("nan")
             final_iteration = evaluation_count
             if verbose:
                 print(
@@ -817,6 +893,12 @@ class MultiPassageCoupledSolver:
             iterations=final_iteration,
             max_vn=max_vn,
             max_vn_over_vinf=max_vn / max(flow.v_inf, 1e-16),
+            coupling_status=coupling_status,
+            residual_norm=residual_norm,
+            residual_tolerance=floating_point_resolution,
+            solver_success=solver_success,
+            solver_message=solver_message,
+            function_evaluations=evaluation_count,
         )
 
 
@@ -1175,9 +1257,17 @@ def build_model_specs(
     _ = channel_width_m
 
     model_1 = build_model1_chordwise(geom, height)
-    model_2 = build_vertical_passages(np.linspace(0.100, 0.900, 4), height, "m2")
+
+    # Keep Model 2 and the vertical part of Model 3 identical.  The old rear
+    # location x/c=0.900 causes the 9 and 10 mm vertical surface opening to
+    # intersect the rear opening of the inner horizontal channel in Model 3.
+    # Ending the equally spaced set at x/c=0.890 provides finite clearance at
+    # H=10 mm while preserving the four-channel lower-to-upper layout.
+    vertical_x_values = np.linspace(0.100, 0.890, 4)
+
+    model_2 = build_vertical_passages(vertical_x_values, height, "m2")
     model_3h = _copy_passages_with_prefix(model_1, "m3c", "LE_to_TE_internal_channel")
-    model_3v = build_vertical_passages(np.linspace(0.100, 0.900, 4), height, "m3v")
+    model_3v = build_vertical_passages(vertical_x_values, height, "m3v")
     # model_4 = build_model4_saved_case1(height)
 
     size_text = (
@@ -1474,6 +1564,18 @@ def representative_pore_diameter(model: PorousModelSpec) -> float:
     return representative_channel_height(model)
 
 
+def coupling_diagnostics(result: MultiPassageResult) -> dict:
+    """Diagnostics are retained even when physical results are NaN."""
+    return {
+        "coupling_status": result.coupling_status,
+        "coupling_residual_max": result.residual_norm,
+        "coupling_residual_tolerance": result.residual_tolerance,
+        "coupling_solver_success": result.solver_success,
+        "coupling_solver_message": result.solver_message,
+        "coupling_function_evaluations": result.function_evaluations,
+    }
+
+
 def nan_if_not_converged(value: float, converged: bool) -> float:
     """Return value for converged cases and NaN for non-converged cases."""
     return float(value) if converged else float("nan")
@@ -1521,6 +1623,7 @@ def make_nonconverged_summary_row(
         "max_vn_over_vinf": nan,
         "coupling_converged": False,
         "coupling_iterations": porous_result.iterations,
+        **coupling_diagnostics(porous_result),
         "elapsed_seconds": elapsed_seconds,
     }
 
@@ -1608,6 +1711,7 @@ def build_model_summary_row(
         "max_vn_over_vinf": porous_result.max_vn_over_vinf,
         "coupling_converged": porous_result.converged,
         "coupling_iterations": porous_result.iterations,
+        **coupling_diagnostics(porous_result),
         "elapsed_seconds": elapsed_seconds,
     }
 
@@ -1759,7 +1863,12 @@ def run_porous_aoa_sweep_for_model(
                 "max_vn_over_vinf": nan,
             }
 
+        row.update(coupling_diagnostics(coupled_i))
         rows.append(row)
+        if not coupled_i.converged:
+            print(f"[Case] alpha={alpha:g} deg, H={1000*representative_channel_height(model):g} mm: "
+                  f"{coupled_i.coupling_status}; residual={coupled_i.residual_norm:.3e}; "
+                  f"{coupled_i.solver_message}")
 
     if export_paraview and paraview_output_dir is not None and paraview_cases:
         export_aoa_sweep_collections(

@@ -62,7 +62,7 @@ from ..porous import (
 # USER SETTINGS
 # =============================================================================
 STREAMLINE_AOA_DEG = 10
-STREAMLINE_PORE_DIAMETER_M = 0.0090
+STREAMLINE_PORE_DIAMETER_M = 0.0080
 
 STREAMLINE_MODEL_NAMES = (
     "model_1_4_chordwise",

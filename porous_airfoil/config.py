@@ -210,9 +210,9 @@ AOA_SWEEP_END_DEG = 15.0
 AOA_SWEEP_STEP_DEG = 1.0
 
 AOA_SWEEP_CHANNEL_HEIGHTS = (
+    0.0060,
+    0.0070,
     0.0080,
-    0.0090,
-    0.0100,
 )
 
 # Backward-compatible alias.
@@ -269,6 +269,7 @@ class GeometryLimits:
     # channel fits inside the airfoil body.
     endpoint_fit_margin: float = 0.02
 
+N_CRIT: float = 9.0  # Amplification factor threshold for e^N transition
 
 @dataclass(frozen=True)
 class Pore:
@@ -396,6 +397,12 @@ class MultiPassageResult:
     iterations: int
     max_vn: float
     max_vn_over_vinf: float
+    coupling_status: str = "unknown"
+    residual_norm: float = float("nan")
+    residual_tolerance: float = float("nan")
+    solver_success: bool = False
+    solver_message: str = ""
+    function_evaluations: int = 0
 
 
 # =============================================================================

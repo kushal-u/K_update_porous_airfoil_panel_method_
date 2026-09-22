@@ -22,7 +22,7 @@ from matplotlib.path import Path as MplPath
 # Optional Numba acceleration for the velocity-field kernel.
 # When numba is available the inner double loop (field-points x panels) is
 # JIT-compiled and parallelised with prange.  When numba is absent the pure-
-# NumPy fallback is used automatically — identical maths, no change required
+# NumPy fallback is used automatically â€” identical maths, no change required
 # by the caller.
 # ---------------------------------------------------------------------------
 try:
@@ -44,13 +44,13 @@ def _make_velocity_kernel():
     The outer loop is over panels k; the inner loop accumulates onto every
     exterior field point.  In the numba path, prange parallelises over field
     points so each thread owns an independent slice and touches a disjoint
-    portion of u/v — no race condition.
+    portion of u/v â€” no race condition.
     """
     if _NUMBA_AVAILABLE:
         @njit(parallel=True, cache=True, fastmath=True)
         def _kernel(xp, yp, XB0, YB0, S, cos_phi, sin_phi, lam, gamma,
                     u_inf, v_inf):
-            """Numba JIT + parallel kernel — Clement SPM/VPM methodology."""
+            """Numba JIT + parallel kernel â€” Clement SPM/VPM methodology."""
             npts   = len(xp)
             npan   = len(S)
             inv_2pi = 1.0 / (2.0 * np.pi)
@@ -59,7 +59,7 @@ def _make_velocity_kernel():
             v = np.empty(npts)
 
             # prange: each thread handles a contiguous slice of field points.
-            # The panel loop inside is read-only on shared arrays → no races.
+            # The panel loop inside is read-only on shared arrays â†’ no races.
             for ip in prange(npts):          # pylint: disable=not-an-iterable
                 xpi = xp[ip]
                 ypi = yp[ip]
@@ -86,13 +86,13 @@ def _make_velocity_kernel():
                     log_term  = np.log(log_arg)
                     atan_term = np.arctan2(sk + A, E) - np.arctan2(A, E)
 
-                    # SOURCE kernel — Clement's STREAMLINE_SPM
+                    # SOURCE kernel â€” Clement's STREAMLINE_SPM
                     # Cx = -cos(phi),  Dx = dx   (XP - XB[j])
                     # Cy = -sin(phi),  Dy = dy   (YP - YB[j])
                     Mx = 0.5 * (-cp) * log_term + ((dx - A * (-cp)) / E) * atan_term
                     My = 0.5 * (-sp) * log_term + ((dy - A * (-sp)) / E) * atan_term
 
-                    # VORTEX kernel — Clement's STREAMLINE_VPM
+                    # VORTEX kernel â€” Clement's STREAMLINE_VPM
                     # Cx =  sin(phi),  Dx = -dy  (-(YP - YB[j]))
                     # Cy = -cos(phi),  Dy =  dx  (  XP - XB[j] )
                     Nx = 0.5 *   sp  * log_term + ((-dy - A *   sp ) / E) * atan_term
@@ -108,12 +108,12 @@ def _make_velocity_kernel():
 
     else:
         # ------------------------------------------------------------------
-        # Pure-NumPy fallback — vectorised over field points for each panel.
+        # Pure-NumPy fallback â€” vectorised over field points for each panel.
         # Identical maths to the numba path; used when numba is not installed.
         # ------------------------------------------------------------------
         def _kernel(xp, yp, XB0, YB0, S, cos_phi, sin_phi, lam, gamma,
                     u_inf, v_inf):
-            """NumPy fallback kernel — Clement SPM/VPM methodology."""
+            """NumPy fallback kernel â€” Clement SPM/VPM methodology."""
             inv_2pi = 1.0 / (2.0 * np.pi)
             u = np.full(len(xp), u_inf)
             v = np.full(len(yp), v_inf)
@@ -132,11 +132,11 @@ def _make_velocity_kernel():
                 log_term  = np.log((sk * sk + 2.0 * A * sk + B) / B)
                 atan_term = np.arctan2(sk + A, E) - np.arctan2(A, E)
 
-                # SOURCE kernel — Clement's STREAMLINE_SPM
+                # SOURCE kernel â€” Clement's STREAMLINE_SPM
                 Mx = 0.5 * (-cp) * log_term + ((dx - A * (-cp)) / E) * atan_term
                 My = 0.5 * (-sp) * log_term + ((dy - A * (-sp)) / E) * atan_term
 
-                # VORTEX kernel — Clement's STREAMLINE_VPM
+                # VORTEX kernel â€” Clement's STREAMLINE_VPM
                 Nx = 0.5 *   sp  * log_term + ((-dy - A *   sp ) / E) * atan_term
                 Ny = 0.5 * (-cp) * log_term + (( dx - A * (-cp)) / E) * atan_term
 
@@ -148,7 +148,7 @@ def _make_velocity_kernel():
     return _kernel
 
 
-# Module-level singleton — compiled once on first import (numba path) or
+# Module-level singleton â€” compiled once on first import (numba path) or
 # defined once as a plain function (numpy fallback).
 _velocity_kernel = _make_velocity_kernel()
 
@@ -192,9 +192,10 @@ class CouplingConfig:
     does not use under-relaxation or user-defined convergence tolerances.
     """
 
-    max_iter: int = 500
+    max_iter: int = 10000
 
-
+def generate_naca4(airfoil_str, n_points=100): # or whatever the parameter name is
+    code = str(code).lower().replace("naca", "").replace(" ", "").replace("-", "").strip()
 # =============================================================================
 # GEOMETRY HELPERS
 # =============================================================================
@@ -220,7 +221,11 @@ def generate_naca4(
     tuple[np.ndarray, np.ndarray]
         Closed airfoil boundary coordinates `(XB, YB)`.
     """
-    if len(airfoil_name) != 4 or not airfoil_name.isdigit():
+    # Sanitize 'airfoil_name' into 4-digit 'code'
+    code = str(airfoil_name).lower().replace("naca", "").replace(" ", "").replace("-", "").strip()
+    
+    # Validate the sanitized 'code', not 'airfoil_name'
+    if len(code) != 4 or not code.isdigit():
         raise ValueError("Only NACA 4-digit airfoils are supported.")
     if n_panels < 10:
         raise ValueError("n_panels must be at least 10.")
@@ -745,7 +750,7 @@ class SourceVortexPanelMethod:
         (vortex) exactly.  The heavy double loop (field-points x panels) is
         delegated to the module-level ``_velocity_kernel``, which is:
 
-        * **numba** ``@njit(parallel=True)`` when numba is installed — the
+        * **numba** ``@njit(parallel=True)`` when numba is installed â€” the
           field-point loop is parallelised with ``prange`` and the inner
           panel loop is JIT-compiled with ``fastmath``.
         * a **pure-NumPy** fallback (vectorised over field-points for each

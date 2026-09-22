@@ -11,7 +11,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-
+from ..config import AOA_SWEEP_CHANNEL_HEIGHTS
 from .common import safe_mkdir, windows_long_path
 
 
@@ -324,9 +324,9 @@ OUTPUT_DIR = SEARCH_ROOT / "aero_graphs_three_diameters"
 
 # Three diameters compared in every model panel.
 SELECT_PORE_DIAMETERS_M = (
+    0.0060,
+    0.0070,
     0.0080,
-    0.0090,
-    0.0100,
 )
 
 # Retain the original validation/reference curves.
