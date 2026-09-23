@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import root
+from scipy.optimize import least_squares, root
 from .solver import (
     CouplingConfig,
     FlowConfig,
@@ -67,6 +67,46 @@ from .integrations.paraview import export_aoa_sweep_collections, export_paraview
 # INTERNAL CHANNEL HYDRAULIC RESISTANCE
 # =============================================================================
 INTERNAL_RE_TRANSITION = 2300.0
+
+# Reduced interface model, not a resolved jet/mixing calculation.
+# Inlet direction follows the static-pressure difference. Inlet tangential
+# kinetic energy is dissipated (zero recovery). The separate bulk outlet jet
+# matches exterior static pressure and carries alpha_j*rho*(q'/H)^2/2.
+# Set "legacy_static" only for comparison with old results.
+CHANNEL_ENERGY_CLOSURE = "zero_tangential_recovery_jet"
+JET_KINETIC_ENERGY_FACTOR = 1.0  # uniform bulk jet; not a fitted loss coefficient
+
+# -----------------------------------------------------------------------------
+# NONLINEAR CONTINUATION SETTINGS
+# -----------------------------------------------------------------------------
+# These settings change only the numerical path used to reach the requested
+# physical state.  Every reported solution is still checked at the requested
+# AoA, Reynolds number and full coupling strength lambda=1.
+ADAPTIVE_AOA_MIN_STEP_DEG = 0.05
+RE_CONTINUATION_REFERENCE = 5.0e5
+RE_CONTINUATION_INITIAL_DIVISIONS = 5
+RE_CONTINUATION_MIN_STEP = 1.0e4
+HOMOTOPY_INITIAL_STEP = 0.20
+HOMOTOPY_MIN_STEP = 0.025
+
+# Branch-boundary refinement.  These tolerances control only how accurately a
+# loss-of-root boundary is bracketed; they do not relax the nonlinear root
+# acceptance criterion used for physical results.
+AOA_BOUNDARY_TOL_DEG = 0.01
+RE_BOUNDARY_TOL = 2.0e3
+HOMOTOPY_BOUNDARY_TOL = 2.0e-3
+
+# Pseudo-arclength continuation settings.  The arclength state contains the
+# dimensionless passage-flow vector plus alpha/PAL_ALPHA_SCALE_DEG.
+PAL_ALPHA_SCALE_DEG = 1.0
+PAL_INITIAL_DS = 0.05
+PAL_MIN_DS = 0.005
+PAL_MAX_DS = 0.20
+PAL_MAX_STEPS = 50
+PAL_CORRECTOR_TOL = 1.0e-8
+PAL_TARGET_TOL_DEG = 0.02
+PAL_ALPHA_LIMIT_DEG = 30.0
+
 
 
 def _smooth_transition_weight(
@@ -138,6 +178,7 @@ def solve_rectangular_channel_flow(
     mu: float,
     length: float,
     height: float,
+    outlet_kinetic_factor: float = 0.0,
 ) -> tuple[float, float, float, float, str]:
     """Solve the 2D rectangular-channel flow rate per unit span.
 
@@ -151,8 +192,15 @@ def solve_rectangular_channel_flow(
     ``q_prime`` has units m^2/s. The flow-through area per unit span is H,
     therefore ``U_bar = q_prime/H``. The visible in-plane area ``L*H`` is not
     used as the flow-through area.
+    When outlet_kinetic_factor > 0, dp is the available inlet-to-outlet
+    head in pressure units, not just the distributed friction drop. The
+    scalar equation includes outlet_kinetic_factor*rho*U_bar**2/2. This
+    kinetic energy leaves with the jet; it is not a friction loss.
     """
     dp = float(dp)
+    outlet_kinetic_factor = float(outlet_kinetic_factor)
+    if not np.isfinite(outlet_kinetic_factor) or outlet_kinetic_factor < 0.0:
+        raise ValueError("outlet_kinetic_factor must be finite and nonnegative.")
     rho = float(rho)
     mu = float(mu)
     length = float(length)
@@ -180,6 +228,7 @@ def solve_rectangular_channel_flow(
             length=length,
             height=height,
         )
+        dp_high += outlet_kinetic_factor * 0.5 * rho * u_high**2
         if dp_high >= dp_abs:
             break
         u_high *= 2.0
@@ -195,6 +244,7 @@ def solve_rectangular_channel_flow(
             length=length,
             height=height,
         )
+        dp_mid += outlet_kinetic_factor * 0.5 * rho * u_mid**2
         if dp_mid < dp_abs:
             u_low = u_mid
         else:
@@ -210,6 +260,8 @@ def solve_rectangular_channel_flow(
     )
 
     q_prime_abs = mean_velocity * height
+    if outlet_kinetic_factor > 0.0:
+        model_name += "+outlet_jet_kinetic_head"
     equivalent_resistance = dp_abs / max(q_prime_abs, 1.0e-30)
 
     if not all(
@@ -479,46 +531,93 @@ class IndependentPassage:
         geom: PanelGeometry,
         panel_pressures: np.ndarray,
         flow: FlowConfig,
+        aero_result: object | None = None,
     ) -> PassageState:
-        """
-        Solve one internal channel using pressure integrated over its actual openings.
-        """
-        p1 = self._area_average_pressure_at_pore(
-            geom=geom,
-            pore=self.pore1,
-            panel_pressures=panel_pressures,
-            min_panels=9,
-        )
-        p2 = self._area_average_pressure_at_pore(
-            geom=geom,
-            pore=self.pore2,
-            panel_pressures=panel_pressures,
-            min_panels=9,
-        )
+        """Static-pressure-selected inlet, zero tangential recovery, separate jet.
 
+        p_in + <rho*Vn_in^2/2> - p_out
+            = dp_friction(q') + alpha_j*rho*(q'/H)^2/2.
+
+        Inlet tangential kinetic energy is removed before entering the channel.
+        Outlet static pressure matches the exterior, but its velocity/total
+        pressure are those of the bulk jet, not the surrounding potential flow.
+        This is a conservative reduced closure hypothesis; jet mixing and
+        tangential recovery are not resolved or calibrated.
+        """
+        p1 = self._area_average_pressure_at_pore(geom, self.pore1, panel_pressures)
+        p2 = self._area_average_pressure_at_pore(geom, self.pore2, panel_pressures)
         dp = p1 - p2
-
         length = self.passage_length(geom)
-        q, rs, reynolds, friction_factor, resistance_model = (
-            solve_rectangular_channel_flow(
-                dp=dp,
-                rho=flow.rho_inf,
-                mu=flow.mu_inf,
-                length=length,
-                height=self.chamber.height,
-            )
-        )
+        closure = CHANNEL_ENERGY_CLOSURE
+        if closure not in {"legacy_static", "zero_tangential_recovery_jet"}:
+            raise ValueError(f"Unknown CHANNEL_ENERGY_CLOSURE: {closure}")
+        normal_head = tangential_head = 0.0
+        kinetic_factor = 0.0
+        if closure == "zero_tangential_recovery_jet":
+            if aero_result is None or getattr(aero_result, "Vn", None) is None:
+                raise ValueError("Install the matching solver.py and pass aero_result "
+                                 "to network.solve for the inlet/jet energy closure.")
+            vn = np.asarray(aero_result.Vn, dtype=float)
+            vt = np.asarray(aero_result.Vt, dtype=float)
+            if vn.shape != (geom.num_pan,) or vt.shape != (geom.num_pan,):
+                raise ValueError("Invalid aerodynamic velocity arrays for channel energy closure.")
+            # Same linear averaging operator for pressure and kinetic heads:
+            # <p> + <rho*(Vt^2+Vn^2)/2> = p0_inf, up to roundoff.
+            inlet = self.pore1 if dp >= 0.0 else self.pore2
+            normal_head = self._area_average_pressure_at_pore(
+                geom, inlet, 0.5*flow.rho_inf*vn**2)
+            tangential_head = self._area_average_pressure_at_pore(
+                geom, inlet, 0.5*flow.rho_inf*vt**2)
+            kinetic_factor = float(JET_KINETIC_ENERGY_FACTOR)
+            if not np.isfinite(kinetic_factor) or kinetic_factor < 1.0:
+                raise ValueError("JET_KINETIC_ENERGY_FACTOR must be finite and >= 1.")
 
-        return PassageState(
-            Q=float(q),
-            p1=p1,
-            p2=p2,
-            dp_total=float(abs(dp)),
-            Rs=float(rs),
-            reynolds_equivalent=float(reynolds),
-            friction_factor=float(friction_factor),
+        # This reduced pressure-driven model excludes inertia-driven flow against
+        # the static-pressure gradient. At an exact tie it selects zero flow.
+        direction = float(np.sign(dp))
+        available_head = abs(dp) + normal_head if direction != 0.0 else 0.0
+        q, _, reynolds, friction_factor, resistance_model = solve_rectangular_channel_flow(
+            dp=direction*available_head,
+            rho=flow.rho_inf,
+            mu=flow.mu_inf,
+            length=length,
+            height=self.chamber.height,
+            outlet_kinetic_factor=kinetic_factor,
+        )
+        speed = abs(q)/self.chamber.height
+        friction_head = _rectangular_2d_pressure_drop_abs(
+            speed, flow.rho_inf, flow.mu_inf, length, self.chamber.height)[0]
+        jet_head = kinetic_factor*0.5*flow.rho_inf*speed**2
+        # Rs retains the original static-pressure-difference / flow meaning.
+        rs = abs(dp)/abs(q) if q != 0.0 else float("inf")
+        state = PassageState(
+            Q=float(q), p1=p1, p2=p2, dp_total=float(abs(dp)), Rs=float(rs),
+            reynolds_equivalent=float(reynolds), friction_factor=float(friction_factor),
             resistance_model=str(resistance_model),
         )
+        p_in, p_out = (p1, p2) if dp >= 0.0 else (p2, p1)
+        active = direction != 0.0
+        energy_residual = available_head-friction_head-jet_head
+        state.energy_diagnostics = {
+            "energy_closure": closure,
+            "energy_balance_active": bool(active),
+            "inlet_pore": 1 if dp > 0.0 else (2 if dp < 0.0 else 0),
+            "inlet_normal_kinetic_head_Pa": float(normal_head),
+            "inlet_tangential_head_removed_Pa": float(tangential_head),
+            "available_channel_head_Pa": float(available_head),
+            "channel_friction_loss_Pa": float(friction_head),
+            "outlet_jet_kinetic_head_Pa": float(jet_head),
+            "outlet_jet_speed_m_s": float(speed),
+            "channel_inlet_total_pressure_Pa": float(p_in+normal_head) if active else float("nan"),
+            "outlet_jet_total_pressure_Pa": float(p_out+jet_head) if active else float("nan"),
+            "energy_balance_residual_Pa": float(energy_residual),
+            "friction_power_W_per_m_span": float(abs(q)*friction_head),
+            "inlet_turning_power_W_per_m_span": float(abs(q)*tangential_head),
+            "outlet_kinetic_energy_flux_W_per_m_span": float(abs(q)*jet_head),
+        }
+        if abs(energy_residual) > 1e-10*max(1.0, available_head):
+            raise FloatingPointError("Channel energy equation failed its residual check.")
+        return state
 
 
     def transpiration_from_flow(
@@ -621,11 +720,13 @@ class IndependentPassageNetwork:
         geom: PanelGeometry,
         panel_pressures: np.ndarray,
         flow: FlowConfig,
+        aero_result: object | None = None,
     ) -> list[PassageState]:
         return [
             passage.solve(
                 geom=geom,
                 panel_pressures=panel_pressures,
+                aero_result=aero_result,
                 flow=flow,
             )
             for passage in self.passages
@@ -668,73 +769,68 @@ class MultiPassageCoupledSolver:
         self,
         verbose: bool = False,
         initial_vn: np.ndarray | None = None,
+        initial_q: np.ndarray | None = None,
+        coupling_strength: float = 1.0,
     ) -> MultiPassageResult:
         """Solve the coupled pressure-flow equations as a nonlinear root problem.
 
-        The unknowns are dimensionless flow rates per unit span in the
-        independent passages. Each physical flow rate is scaled by ``H V_inf``
-        before it is passed to the nonlinear solver. For a trial flow vector,
-        the method maps the flow to panel transpiration, solves the external
-        panel method, calculates the pore pressures, and obtains a new
-        hydraulic flow vector. The dimensionless residual is
+        Parameters
+        ----------
+        verbose
+            Print nonlinear residual evaluations.
+        initial_vn
+            Backward-compatible initial transpiration field.  It is used only
+            to construct an initial flow-rate guess.
+        initial_q
+            Preferred continuation seed: physical passage flow rates per unit
+            span [m^2/s].  Passing Q directly is robust when AoA or Reynolds
+            number changes because the solver rescales it using the new H*Vinf.
+        coupling_strength
+            Homotopy parameter lambda in [0,1].  The trial transpiration is
+            lambda times the physical Q-to-vn mapping.  lambda=1 is exactly the
+            original fully coupled model; lambda<1 is used only for numerical
+            continuation and must never be reported as a physical final state.
 
-            residual = (trial flow - pressure-driven flow) / (H V_inf).
+        Notes
+        -----
+        The nonlinear unknown is the dimensionless passage-flow vector.  For a
+        trial Q the code maps Q to surface transpiration, solves the external
+        panel method, calculates opening pressures, obtains the pressure-driven
+        channel flows, and forms
 
-        No under-relaxation or user-defined coupling tolerance is applied.
-        SciPy's nonlinear solver supplies its machine-precision-aware stopping
-        logic, while ``max_iter`` remains a safety limit on residual
-        evaluations. Convergence is classified from the scaled residual using
-        the finite-difference resolution of double-precision arithmetic, not
-        from SciPy's status flag alone.
+            R = (Q_trial - Q_pressure_driven) / (H V_inf).
 
-        If ``initial_vn`` is provided, it is used only to form a passage-flow
-        starting guess. It does not alter the coupled equations.
+        HYBR is tried with two step factors, followed by TRF least-squares.
+        Solver status alone is never accepted: convergence requires the original
+        scaled residual to satisfy the machine-resolution-based criterion.
         """
         geom = self.aero_solver.geom
         flow = self.aero_solver.flow
-
-
         n_passages = len(self.network.passages)
-        if initial_vn is None:
-            starting_vn = np.zeros(geom.num_pan, dtype=float)
-        else:
-            starting_vn = np.asarray(initial_vn, dtype=float).copy()
-            if starting_vn.shape != (geom.num_pan,):
-                raise ValueError(
-                    f"initial_vn must have shape ({geom.num_pan},), "
-                    f"got {starting_vn.shape}."
-                )
-            if not np.all(np.isfinite(starting_vn)):
-                raise ValueError("initial_vn must contain only finite values.")
 
-        last_finite_vn = starting_vn.copy()
-        last_finite_aero = self.aero_solver.solve(
-            normal_transpiration=starting_vn
-        )
+        coupling_strength = float(coupling_strength)
+        if not np.isfinite(coupling_strength) or not (0.0 <= coupling_strength <= 1.0):
+            raise ValueError("coupling_strength must be finite and lie in [0, 1].")
+        if initial_q is not None and initial_vn is not None:
+            raise ValueError("Provide initial_q or initial_vn, not both.")
+
         try:
             self.network.validate_geometry(geom, self.limits)
         except ValueError as exc:
+            zero_vn = np.zeros(geom.num_pan, dtype=float)
+            aero = self.aero_solver.solve(normal_transpiration=zero_vn)
             return MultiPassageResult(
-                aero_result=last_finite_aero, passage_states=[],
-                normal_transpiration=starting_vn, converged=False,
-                iterations=0, max_vn=float("nan"), max_vn_over_vinf=float("nan"),
-                coupling_status="invalid_geometry", solver_message=str(exc),
+                aero_result=aero,
+                passage_states=[],
+                normal_transpiration=zero_vn,
+                converged=False,
+                iterations=0,
+                max_vn=float("nan"),
+                max_vn_over_vinf=float("nan"),
+                coupling_status="invalid_geometry",
+                solver_message=str(exc),
             )
-        residual_norm = float("nan")
-        floating_point_resolution = float("nan")
-        solver_success = False
-        solver_message = ""
-        coupling_status = "not_converged"
-        last_finite_pressures = self.aero_solver.panel_pressures(last_finite_aero)
-        last_finite_states = self.network.solve(
-            geom=geom,
-            panel_pressures=last_finite_pressures,
-            flow=flow,
-        )
-        initial_q = np.asarray(
-            [float(state.Q) for state in last_finite_states],
-            dtype=float,
-        )
+
         q_scale = np.asarray(
             [
                 max(
@@ -745,12 +841,9 @@ class MultiPassageCoupledSolver:
             ],
             dtype=float,
         )
-        initial_q_dimensionless = initial_q / q_scale
-        evaluation_count = 0
-        numerical_failure = False
 
         def states_for_trial_flow(q_trial: np.ndarray) -> list[PassageState]:
-            """Create lightweight states for the linear Q-to-vn mapping."""
+            """Create lightweight states for the conservative Q-to-vn mapping."""
             return [
                 PassageState(
                     Q=float(q_value),
@@ -763,38 +856,91 @@ class MultiPassageCoupledSolver:
                 for q_value in q_trial
             ]
 
-        def coupling_residual(
-            q_trial_dimensionless: np.ndarray,
-        ) -> np.ndarray:
+        # Construct a physically consistent starting state.
+        if initial_q is not None:
+            seed_q = np.asarray(initial_q, dtype=float).copy()
+            if seed_q.shape != (n_passages,):
+                raise ValueError(
+                    f"initial_q must have shape ({n_passages},), got {seed_q.shape}."
+                )
+            if not np.all(np.isfinite(seed_q)):
+                raise ValueError("initial_q must contain only finite values.")
+            full_seed_vn = self.network.transpiration_from_flow(
+                geom=geom,
+                states=states_for_trial_flow(seed_q),
+            )
+            starting_vn = coupling_strength * full_seed_vn
+            initial_q_dimensionless = seed_q / q_scale
+        else:
+            if initial_vn is None:
+                starting_vn = np.zeros(geom.num_pan, dtype=float)
+            else:
+                starting_vn = np.asarray(initial_vn, dtype=float).copy()
+                if starting_vn.shape != (geom.num_pan,):
+                    raise ValueError(
+                        f"initial_vn must have shape ({geom.num_pan},), "
+                        f"got {starting_vn.shape}."
+                    )
+                if not np.all(np.isfinite(starting_vn)):
+                    raise ValueError("initial_vn must contain only finite values.")
+
+            seed_aero = self.aero_solver.solve(normal_transpiration=starting_vn)
+            seed_pressures = self.aero_solver.panel_pressures(seed_aero)
+            seed_states = self.network.solve(
+                geom=geom,
+                panel_pressures=seed_pressures,
+                aero_result=seed_aero,
+                flow=flow,
+            )
+            seed_q = np.asarray([float(state.Q) for state in seed_states], dtype=float)
+            initial_q_dimensionless = seed_q / q_scale
+
+        last_finite_vn = starting_vn.copy()
+        last_finite_aero = self.aero_solver.solve(normal_transpiration=starting_vn)
+        last_finite_pressures = self.aero_solver.panel_pressures(last_finite_aero)
+        last_finite_states = self.network.solve(
+            geom=geom,
+            panel_pressures=last_finite_pressures,
+            aero_result=last_finite_aero,
+            flow=flow,
+        )
+
+        residual_norm = float("nan")
+        floating_point_resolution = float("nan")
+        solver_success = False
+        solver_message = ""
+        coupling_status = "not_converged"
+        evaluation_count = 0
+        numerical_failure = False
+
+        def coupling_residual(q_trial_dimensionless: np.ndarray) -> np.ndarray:
             nonlocal evaluation_count
             nonlocal last_finite_vn
             nonlocal last_finite_aero
             nonlocal last_finite_states
 
             evaluation_count += 1
-            q_trial_dimensionless = np.asarray(
-                q_trial_dimensionless,
-                dtype=float,
-            )
+            q_trial_dimensionless = np.asarray(q_trial_dimensionless, dtype=float)
             if (
                 q_trial_dimensionless.shape != (n_passages,)
                 or not np.all(np.isfinite(q_trial_dimensionless))
             ):
                 raise FloatingPointError("Non-finite passage-flow trial state.")
+
             q_trial = q_trial_dimensionless * q_scale
 
             with np.errstate(over="raise", invalid="raise", divide="raise"):
-                vn_trial = self.network.transpiration_from_flow(
+                vn_full = self.network.transpiration_from_flow(
                     geom=geom,
                     states=states_for_trial_flow(q_trial),
                 )
-                aero_result = self.aero_solver.solve(
-                    normal_transpiration=vn_trial
-                )
+                vn_trial = coupling_strength * vn_full
+                aero_result = self.aero_solver.solve(normal_transpiration=vn_trial)
                 panel_pressures = self.aero_solver.panel_pressures(aero_result)
                 hydraulic_states = self.network.solve(
                     geom=geom,
                     panel_pressures=panel_pressures,
+                    aero_result=aero_result,
                     flow=flow,
                 )
 
@@ -819,7 +965,8 @@ class MultiPassageCoupledSolver:
 
             if verbose:
                 print(
-                    f"[Coupling] evaluation={evaluation_count:03d} | "
+                    f"[Coupling] lambda={coupling_strength:.3f} | "
+                    f"evaluation={evaluation_count:03d} | "
                     f"CL={aero_result.CL: .8f} | "
                     f"max|Q|={np.max(np.abs(q_trial)): .6e} | "
                     f"max|scaled residual|={np.max(np.abs(residual)): .3e}"
@@ -827,61 +974,175 @@ class MultiPassageCoupledSolver:
 
             return residual
 
-        try:
-            nonlinear_result = root(
-                coupling_residual,
-                initial_q_dimensionless,
-                method="hybr",
-                options={"maxfev": int(self.coupling.max_iter)},
-            )
-            solver_success = bool(nonlinear_result.success)
-            solver_message = str(nonlinear_result.message).replace("\n", " ")
-            final_q_dimensionless = np.asarray(
-                nonlinear_result.x,
-                dtype=float,
-            )
-            if np.all(np.isfinite(final_q_dimensionless)):
-                final_residual = coupling_residual(final_q_dimensionless)
-            else:
-                numerical_failure = True
-                final_residual = np.full(n_passages, np.inf, dtype=float)
+        # ------------------------------------------------------------------
+        # Robust nonlinear solution hierarchy
+        # ------------------------------------------------------------------
+        best_q_dimensionless = initial_q_dimensionless.copy()
+        best_residual_norm = float("inf")
+        best_residual_tolerance = float("nan")
+        best_method = "initial_guess"
+        attempt_messages: list[str] = []
+        converged = False
+        final_iteration = 0
+        selected_solver_message = ""
 
-            residual_norm = float(np.max(np.abs(final_residual)))
-            state_scale = max(
-                1.0,
-                float(np.max(np.abs(final_q_dimensionless))),
-            )
-            floating_point_resolution = (
-                np.sqrt(np.finfo(float).eps) * state_scale
-            )
-            residual_resolved = residual_norm <= floating_point_resolution
-            converged = bool(
-                not numerical_failure
-                and residual_resolved
-            )
+        def assess_candidate(
+            q_dimensionless: np.ndarray,
+            method_name: str,
+        ) -> tuple[float, float, bool]:
+            nonlocal best_q_dimensionless
+            nonlocal best_residual_norm
+            nonlocal best_residual_tolerance
+            nonlocal best_method
+
+            q_dimensionless = np.asarray(q_dimensionless, dtype=float)
+            if (
+                q_dimensionless.shape != (n_passages,)
+                or not np.all(np.isfinite(q_dimensionless))
+            ):
+                return float("inf"), float("nan"), False
+
+            residual = coupling_residual(q_dimensionless)
+            norm = float(np.max(np.abs(residual)))
+            state_scale = max(1.0, float(np.max(np.abs(q_dimensionless))))
+            tolerance = float(np.sqrt(np.finfo(float).eps) * state_scale)
+
+            if np.isfinite(norm) and norm < best_residual_norm:
+                best_residual_norm = norm
+                best_residual_tolerance = tolerance
+                best_q_dimensionless = q_dimensionless.copy()
+                best_method = method_name
+
+            return norm, tolerance, bool(norm <= tolerance)
+
+        try:
+            current_guess = initial_q_dimensionless.copy()
+
+            for factor in (0.5, 0.2):
+                try:
+                    hybr_result = root(
+                        coupling_residual,
+                        current_guess,
+                        method="hybr",
+                        options={
+                            "maxfev": int(self.coupling.max_iter),
+                            "factor": float(factor),
+                            "xtol": 1.0e-10,
+                        },
+                    )
+                    q_candidate = np.asarray(hybr_result.x, dtype=float)
+                    norm, tolerance, resolved = assess_candidate(
+                        q_candidate,
+                        method_name=f"hybr(factor={factor:g})",
+                    )
+                    message = str(hybr_result.message).replace("\n", " ")
+                    attempt_messages.append(
+                        f"HYBR factor={factor:g}: success={bool(hybr_result.success)}, "
+                        f"residual={norm:.3e}, message={message}"
+                    )
+                    if np.all(np.isfinite(q_candidate)):
+                        current_guess = q_candidate.copy()
+                    if resolved:
+                        converged = True
+                        residual_norm = norm
+                        floating_point_resolution = tolerance
+                        solver_success = bool(hybr_result.success)
+                        selected_solver_message = message
+                        best_method = f"hybr(factor={factor:g})"
+                        break
+                except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
+                    attempt_messages.append(
+                        f"HYBR factor={factor:g}: {type(exc).__name__}: {exc}"
+                    )
+
+            if not converged:
+                try:
+                    lsq_result = least_squares(
+                        coupling_residual,
+                        x0=current_guess,
+                        method="trf",
+                        jac="3-point",
+                        x_scale="jac",
+                        ftol=1.0e-12,
+                        xtol=1.0e-12,
+                        gtol=1.0e-12,
+                        max_nfev=max(1000, 4 * int(self.coupling.max_iter)),
+                    )
+                    q_candidate = np.asarray(lsq_result.x, dtype=float)
+                    norm, tolerance, resolved = assess_candidate(
+                        q_candidate,
+                        method_name="least_squares(TRF)",
+                    )
+                    message = str(lsq_result.message).replace("\n", " ")
+                    attempt_messages.append(
+                        f"TRF: success={bool(lsq_result.success)}, "
+                        f"residual={norm:.3e}, message={message}"
+                    )
+                    if resolved:
+                        converged = True
+                        residual_norm = norm
+                        floating_point_resolution = tolerance
+                        solver_success = bool(lsq_result.success)
+                        selected_solver_message = message
+                        best_method = "least_squares(TRF)"
+                except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
+                    attempt_messages.append(f"TRF: {type(exc).__name__}: {exc}")
+
+            # Synchronize the returned aerodynamic/hydraulic state with the best
+            # candidate, whether or not it is an accepted root.
+            if np.all(np.isfinite(best_q_dimensionless)):
+                try:
+                    norm, tolerance, _ = assess_candidate(
+                        best_q_dimensionless,
+                        method_name=best_method,
+                    )
+                    if not converged:
+                        residual_norm = norm
+                        floating_point_resolution = tolerance
+                except (FloatingPointError, OverflowError, ValueError, RuntimeError):
+                    pass
+
+            if not converged:
+                solver_success = False
+                selected_solver_message = (
+                    f"No retry reached the residual criterion; best method={best_method}."
+                )
+
             final_iteration = evaluation_count
             coupling_status = "converged" if converged else "not_converged"
+            solver_message = (
+                f"lambda={coupling_strength:.3f}; selected={best_method}; "
+                f"{selected_solver_message} "
+                + " | ".join(attempt_messages)
+            ).strip()
 
             if verbose:
                 print(
-                    f"[Coupling] nonlinear solve: "
-                    f"success={nonlinear_result.success}, "
-                    f"evaluations={final_iteration}, "
-                    f"max|scaled residual|={residual_norm:.3e}, "
-                    f"message={nonlinear_result.message}"
+                    f"[Coupling] robust nonlinear solve: "
+                    f"lambda={coupling_strength:.3f}, converged={converged}, "
+                    f"selected={best_method}, evaluations={final_iteration}, "
+                    f"max|scaled residual|={residual_norm:.3e}"
                 )
+                for attempt in attempt_messages:
+                    print(f"[Coupling]   {attempt}")
+
         except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
             converged = False
             numerical_failure = True
             coupling_status = "numerical_failure"
-            solver_message = f"{type(exc).__name__}: {exc}"
-            residual_norm = float("nan")
+            solver_success = False
+            solver_message = (
+                f"lambda={coupling_strength:.3f}; {type(exc).__name__}: {exc}"
+            )
+            residual_norm = (
+                best_residual_norm if np.isfinite(best_residual_norm) else float("nan")
+            )
+            floating_point_resolution = best_residual_tolerance
             final_iteration = evaluation_count
             if verbose:
                 print(
-                    f"[Coupling] nonlinear solve stopped after "
-                    f"{evaluation_count} evaluations: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"[Coupling] robust nonlinear solve stopped after "
+                    f"{evaluation_count} evaluations: {type(exc).__name__}: {exc}"
                 )
 
         max_vn = float(np.max(np.abs(last_finite_vn)))
@@ -889,7 +1150,7 @@ class MultiPassageCoupledSolver:
             aero_result=last_finite_aero,
             passage_states=last_finite_states,
             normal_transpiration=last_finite_vn,
-            converged=bool(converged),
+            converged=bool(converged and not numerical_failure),
             iterations=final_iteration,
             max_vn=max_vn,
             max_vn_over_vinf=max_vn / max(flow.v_inf, 1e-16),
@@ -900,7 +1161,6 @@ class MultiPassageCoupledSolver:
             solver_message=solver_message,
             function_evaluations=evaluation_count,
         )
-
 
 
 # =============================================================================
@@ -1541,6 +1801,7 @@ def build_passage_dataframe(
                 "p2_Pa": state.p2,
                 "friction_factor": state.friction_factor,
                 "resistance_model": state.resistance_model,
+                **getattr(state, "energy_diagnostics", {}),
             }
         )
 
@@ -1567,6 +1828,12 @@ def representative_pore_diameter(model: PorousModelSpec) -> float:
 def coupling_diagnostics(result: MultiPassageResult) -> dict:
     """Diagnostics are retained even when physical results are NaN."""
     return {
+        "energy_closure": CHANNEL_ENERGY_CLOSURE,
+        "energy_model_validated": False,
+        "aerodynamic_force_definition": "closed_contour_pressure_integral",
+        "max_channel_energy_balance_residual_Pa": max(
+            (abs(getattr(s, "energy_diagnostics", {}).get("energy_balance_residual_Pa", float("nan")))
+             for s in result.passage_states), default=float("nan")),
         "coupling_status": result.coupling_status,
         "coupling_residual_max": result.residual_norm,
         "coupling_residual_tolerance": result.residual_tolerance,
@@ -1725,6 +1992,772 @@ def _alpha_directory_name(alpha_deg: float) -> str:
 
 
 # =============================================================================
+# CONTINUATION HELPERS
+# =============================================================================
+def _result_flow_vector(result: MultiPassageResult) -> np.ndarray | None:
+    """Return the converged physical Q vector [m^2/s], or None."""
+    if not result.converged or not result.passage_states:
+        return None
+    q = np.asarray([float(state.Q) for state in result.passage_states], dtype=float)
+    return q if np.all(np.isfinite(q)) else None
+
+
+def _prefer_result(
+    first: MultiPassageResult,
+    second: MultiPassageResult,
+) -> MultiPassageResult:
+    """Prefer a converged result; otherwise keep the smaller finite residual."""
+    if second.converged and not first.converged:
+        return second
+    if first.converged and not second.converged:
+        return first
+    r1 = float(first.residual_norm)
+    r2 = float(second.residual_norm)
+    if np.isfinite(r2) and (not np.isfinite(r1) or r2 < r1):
+        return second
+    return first
+
+
+def _build_coupled_case_context(
+    model: PorousModelSpec,
+    airfoil_name: str,
+    chord: float,
+    n_panels: int,
+    alpha_deg: float,
+    reynolds_external: float,
+    rho_inf: float,
+    mu_inf: float,
+    p_inf: float,
+) -> tuple[
+    FlowConfig,
+    PanelGeometry,
+    SourceVortexPanelMethod,
+    object,
+    IndependentPassageNetwork,
+]:
+    """Build one requested physical case without solving the porous coupling."""
+    flow_i, geom_i, _, aero_solver_i = build_base_problem(
+        airfoil_name=airfoil_name,
+        chord=chord,
+        n_panels=n_panels,
+        aoa_deg=float(alpha_deg),
+        reynolds_external=float(reynolds_external),
+        rho_inf=rho_inf,
+        mu_inf=mu_inf,
+        p_inf=p_inf,
+    )
+    solid_i = aero_solver_i.solve()
+    network_i = build_network_from_model(model=model, span_width=SPAN_WIDTH)
+    return flow_i, geom_i, aero_solver_i, solid_i, network_i
+
+
+def _solve_context(
+    aero_solver: SourceVortexPanelMethod,
+    network: IndependentPassageNetwork,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    initial_q: np.ndarray | None = None,
+    coupling_strength: float = 1.0,
+    verbose: bool = False,
+) -> MultiPassageResult:
+    return MultiPassageCoupledSolver(
+        aero_solver=aero_solver,
+        network=network,
+        coupling=coupling,
+        limits=limits,
+    ).solve(
+        verbose=verbose,
+        initial_q=initial_q,
+        coupling_strength=coupling_strength,
+    )
+
+
+def _solve_full_coupling_with_cold_retry(
+    aero_solver: SourceVortexPanelMethod,
+    network: IndependentPassageNetwork,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    initial_q: np.ndarray | None,
+) -> MultiPassageResult:
+    """Solve lambda=1, retrying from a cold start if a warm start fails."""
+    warm = _solve_context(
+        aero_solver=aero_solver,
+        network=network,
+        coupling=coupling,
+        limits=limits,
+        initial_q=initial_q,
+        coupling_strength=1.0,
+        verbose=False,
+    )
+    if warm.converged or initial_q is None:
+        return warm
+
+    cold = _solve_context(
+        aero_solver=aero_solver,
+        network=network,
+        coupling=coupling,
+        limits=limits,
+        initial_q=None,
+        coupling_strength=1.0,
+        verbose=False,
+    )
+    return _prefer_result(warm, cold)
+
+
+def _solve_with_coupling_homotopy(
+    aero_solver: SourceVortexPanelMethod,
+    network: IndependentPassageNetwork,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    initial_q: np.ndarray | None,
+    original_full_result: MultiPassageResult,
+) -> MultiPassageResult:
+    """Continue lambda from 0 to 1 and bracket a coupling branch limit.
+
+    A converged state is always kept on the low-lambda side.  Once a failed
+    state is encountered, the interval is bisected rather than repeatedly
+    retrying exactly lambda=1.  Only lambda=1 may be returned as a converged
+    physical result.
+    """
+    q_seed = None if initial_q is None else np.asarray(initial_q, dtype=float).copy()
+    stages: list[str] = []
+
+    stage0 = _solve_context(
+        aero_solver=aero_solver,
+        network=network,
+        coupling=coupling,
+        limits=limits,
+        initial_q=q_seed,
+        coupling_strength=0.0,
+        verbose=False,
+    )
+    stages.append(f"lambda=0:{'ok' if stage0.converged else 'fail'}")
+    if not stage0.converged:
+        original_full_result.solver_message += " | homotopy failed at lambda=0"
+        return original_full_result
+
+    low_lam = 0.0
+    low_q = _result_flow_vector(stage0)
+    high_lam: float | None = None
+    step = float(HOMOTOPY_INITIAL_STEP)
+
+    while low_lam < 1.0 - 1.0e-12:
+        if high_lam is None:
+            trial_lam = min(1.0, low_lam + step)
+        else:
+            trial_lam = 0.5 * (low_lam + high_lam)
+
+        stage = _solve_context(
+            aero_solver=aero_solver,
+            network=network,
+            coupling=coupling,
+            limits=limits,
+            initial_q=low_q,
+            coupling_strength=trial_lam,
+            verbose=False,
+        )
+
+        if stage.converged:
+            stages.append(f"lambda={trial_lam:.5f}:ok")
+            low_lam = float(trial_lam)
+            low_q = _result_flow_vector(stage)
+            if low_lam >= 1.0 - 1.0e-12:
+                stage.solver_message = (
+                    "continuation=coupling_homotopy; "
+                    + ", ".join(stages)
+                    + " | "
+                    + stage.solver_message
+                )
+                return stage
+            if high_lam is None:
+                step = min(0.25, step * 1.4)
+        else:
+            stages.append(
+                f"lambda={trial_lam:.5f}:fail(R={stage.residual_norm:.3e})"
+            )
+            high_lam = float(trial_lam)
+
+        if high_lam is not None and (high_lam - low_lam) <= HOMOTOPY_BOUNDARY_TOL:
+            original_full_result.solver_message += (
+                " | homotopy branch boundary bracketed: "
+                f"lambda_converged={low_lam:.6f}, lambda_failed={high_lam:.6f}; "
+                + ", ".join(stages)
+            )
+            return original_full_result
+
+        if high_lam is None and step < HOMOTOPY_MIN_STEP:
+            original_full_result.solver_message += (
+                " | homotopy did not reach lambda=1; " + ", ".join(stages)
+            )
+            return original_full_result
+
+    return original_full_result
+
+
+def _solve_with_reynolds_continuation(
+    model: PorousModelSpec,
+    airfoil_name: str,
+    chord: float,
+    n_panels: int,
+    alpha_deg: float,
+    target_reynolds: float,
+    rho_inf: float,
+    mu_inf: float,
+    p_inf: float,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    initial_q: np.ndarray | None,
+    original_target_result: MultiPassageResult,
+) -> tuple[
+    FlowConfig,
+    PanelGeometry,
+    SourceVortexPanelMethod,
+    object,
+    IndependentPassageNetwork,
+    MultiPassageResult,
+]:
+    """Continue Reynolds number and bracket a loss-of-root boundary."""
+    target_reynolds = float(target_reynolds)
+    start_re = min(float(RE_CONTINUATION_REFERENCE), target_reynolds)
+    target_context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, alpha_deg, target_reynolds,
+        rho_inf, mu_inf, p_inf,
+    )
+
+    if target_reynolds <= start_re + 1.0:
+        return (*target_context, original_target_result)
+
+    start_context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, alpha_deg, start_re,
+        rho_inf, mu_inf, p_inf,
+    )
+    start_result = _solve_full_coupling_with_cold_retry(
+        aero_solver=start_context[2],
+        network=start_context[4],
+        coupling=coupling,
+        limits=limits,
+        initial_q=initial_q,
+    )
+    if not start_result.converged:
+        original_target_result.solver_message += (
+            f" | Re continuation could not establish start Re={start_re:.6g}"
+        )
+        return (*target_context, original_target_result)
+
+    low_re = float(start_re)
+    low_q = _result_flow_vector(start_result)
+    high_re: float | None = None
+    step = max(
+        (target_reynolds - start_re) / max(1, RE_CONTINUATION_INITIAL_DIVISIONS),
+        RE_CONTINUATION_MIN_STEP,
+    )
+    stages = [f"Re={low_re:.6g}:ok"]
+
+    while low_re < target_reynolds - 1.0:
+        if high_re is None:
+            trial_re = min(target_reynolds, low_re + step)
+        else:
+            trial_re = 0.5 * (low_re + high_re)
+
+        trial_context = _build_coupled_case_context(
+            model, airfoil_name, chord, n_panels, alpha_deg, trial_re,
+            rho_inf, mu_inf, p_inf,
+        )
+        trial_result = _solve_full_coupling_with_cold_retry(
+            aero_solver=trial_context[2],
+            network=trial_context[4],
+            coupling=coupling,
+            limits=limits,
+            initial_q=low_q,
+        )
+
+        if trial_result.converged:
+            stages.append(f"Re={trial_re:.6g}:ok")
+            low_re = float(trial_re)
+            low_q = _result_flow_vector(trial_result)
+            if low_re >= target_reynolds - 1.0:
+                trial_result.solver_message = (
+                    "continuation=reynolds; " + ", ".join(stages)
+                    + " | " + trial_result.solver_message
+                )
+                return (*trial_context, trial_result)
+            if high_re is None:
+                step = min(step * 1.4, target_reynolds - low_re)
+        else:
+            stages.append(
+                f"Re={trial_re:.6g}:fail(R={trial_result.residual_norm:.3e})"
+            )
+            high_re = float(trial_re)
+
+        if high_re is not None and (high_re - low_re) <= RE_BOUNDARY_TOL:
+            original_target_result.solver_message += (
+                " | Reynolds branch boundary bracketed: "
+                f"Re_converged={low_re:.6g}, Re_failed={high_re:.6g}; "
+                + ", ".join(stages)
+            )
+            return (*target_context, original_target_result)
+
+    return (*target_context, original_target_result)
+
+
+def _adaptive_aoa_continuation_to_target(
+    model: PorousModelSpec,
+    airfoil_name: str,
+    chord: float,
+    n_panels: int,
+    previous_alpha: float,
+    target_alpha: float,
+    reynolds_external: float,
+    rho_inf: float,
+    mu_inf: float,
+    p_inf: float,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    previous_q: np.ndarray,
+    original_target_result: MultiPassageResult,
+) -> tuple[
+    FlowConfig,
+    PanelGeometry,
+    SourceVortexPanelMethod,
+    object,
+    IndependentPassageNetwork,
+    MultiPassageResult,
+    dict,
+]:
+    """Continue in AoA and refine the converged/failed branch boundary.
+
+    The requested target is retried from every newly converged midpoint.  If it
+    remains unresolved, the routine returns a bracket [alpha_converged,
+    alpha_failed] plus the converged Q vector on the low side.  This metadata is
+    used by pseudo-arclength continuation.
+    """
+    previous_alpha = float(previous_alpha)
+    target_alpha = float(target_alpha)
+    target_context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, target_alpha, reynolds_external,
+        rho_inf, mu_inf, p_inf,
+    )
+    metadata = {
+        "boundary_found": False,
+        "alpha_converged": float("nan"),
+        "alpha_failed": float("nan"),
+        "q_converged": None,
+        "stages": [],
+    }
+
+    if abs(target_alpha - previous_alpha) <= AOA_BOUNDARY_TOL_DEG:
+        return (*target_context, original_target_result, metadata)
+
+    direction = 1.0 if target_alpha > previous_alpha else -1.0
+    low_alpha = previous_alpha
+    low_q = np.asarray(previous_q, dtype=float).copy()
+    high_alpha = target_alpha
+    stages: list[str] = [f"alpha={low_alpha:.6g}:known_ok"]
+
+    while abs(high_alpha - low_alpha) > AOA_BOUNDARY_TOL_DEG:
+        mid_alpha = 0.5 * (low_alpha + high_alpha)
+        mid_context = _build_coupled_case_context(
+            model, airfoil_name, chord, n_panels, mid_alpha, reynolds_external,
+            rho_inf, mu_inf, p_inf,
+        )
+        mid_result = _solve_full_coupling_with_cold_retry(
+            aero_solver=mid_context[2],
+            network=mid_context[4],
+            coupling=coupling,
+            limits=limits,
+            initial_q=low_q,
+        )
+
+        if mid_result.converged:
+            stages.append(f"alpha={mid_alpha:.6g}:ok")
+            low_alpha = float(mid_alpha)
+            low_q = _result_flow_vector(mid_result)
+
+            # A target that failed from the old seed may become reachable from a
+            # state much closer to it, so retry the exact requested equations.
+            retry = _solve_full_coupling_with_cold_retry(
+                aero_solver=target_context[2],
+                network=target_context[4],
+                coupling=coupling,
+                limits=limits,
+                initial_q=low_q,
+            )
+            if retry.converged:
+                stages.append(f"alpha={target_alpha:.6g}:ok_from_refined_seed")
+                retry.solver_message = (
+                    "continuation=adaptive_aoa_boundary; " + ", ".join(stages)
+                    + " | " + retry.solver_message
+                )
+                metadata.update({
+                    "boundary_found": False,
+                    "alpha_converged": target_alpha,
+                    "alpha_failed": float("nan"),
+                    "q_converged": _result_flow_vector(retry),
+                    "stages": stages,
+                })
+                return (*target_context, retry, metadata)
+        else:
+            stages.append(f"alpha={mid_alpha:.6g}:fail(R={mid_result.residual_norm:.3e})")
+            high_alpha = float(mid_alpha)
+
+        # Keep the bracket ordered in the physical marching direction.
+        if direction < 0.0 and low_alpha < high_alpha:
+            low_alpha, high_alpha = high_alpha, low_alpha
+
+    metadata.update({
+        "boundary_found": True,
+        "alpha_converged": float(low_alpha),
+        "alpha_failed": float(high_alpha),
+        "q_converged": None if low_q is None else np.asarray(low_q, dtype=float).copy(),
+        "stages": stages,
+    })
+    original_target_result.solver_message += (
+        " | AoA branch boundary bracketed: "
+        f"alpha_converged={low_alpha:.6f}, alpha_failed={high_alpha:.6f}; "
+        + ", ".join(stages)
+    )
+    return (*target_context, original_target_result, metadata)
+
+
+
+
+def _q_scale_for_context(
+    network: IndependentPassageNetwork,
+    flow: FlowConfig,
+) -> np.ndarray:
+    """Return the H*Vinf scaling used by the nonlinear passage-flow solve."""
+    return np.asarray(
+        [
+            max(
+                float(passage.chamber.height) * float(flow.v_inf),
+                np.finfo(float).tiny,
+            )
+            for passage in network.passages
+        ],
+        dtype=float,
+    )
+
+
+def _states_for_fixed_q(q_values: np.ndarray) -> list[PassageState]:
+    """Create lightweight passage states for a prescribed physical Q vector."""
+    return [
+        PassageState(
+            Q=float(q_value),
+            p1=0.0,
+            p2=0.0,
+            dp_total=0.0,
+            Rs=0.0,
+            reynolds_equivalent=0.0,
+        )
+        for q_value in np.asarray(q_values, dtype=float)
+    ]
+
+
+def _evaluate_coupled_residual_at_q_alpha(
+    model: PorousModelSpec,
+    airfoil_name: str,
+    chord: float,
+    n_panels: int,
+    alpha_deg: float,
+    reynolds_external: float,
+    rho_inf: float,
+    mu_inf: float,
+    p_inf: float,
+    q_dimensionless: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the original full-coupling residual at arbitrary (Q, alpha).
+
+    This is deliberately the same residual used by MultiPassageCoupledSolver at
+    lambda=1.  It is exposed here only so pseudo-arclength continuation can
+    treat alpha as an additional unknown.
+    """
+    flow_i, geom_i, aero_solver_i, _, network_i = _build_coupled_case_context(
+        model=model,
+        airfoil_name=airfoil_name,
+        chord=chord,
+        n_panels=n_panels,
+        alpha_deg=float(alpha_deg),
+        reynolds_external=float(reynolds_external),
+        rho_inf=rho_inf,
+        mu_inf=mu_inf,
+        p_inf=p_inf,
+    )
+    q_scale = _q_scale_for_context(network_i, flow_i)
+    q_dimensionless = np.asarray(q_dimensionless, dtype=float)
+    if q_dimensionless.shape != q_scale.shape or not np.all(np.isfinite(q_dimensionless)):
+        raise FloatingPointError("Invalid pseudo-arclength Q state.")
+
+    q_physical = q_dimensionless * q_scale
+    vn = network_i.transpiration_from_flow(
+        geom=geom_i,
+        states=_states_for_fixed_q(q_physical),
+    )
+    aero = aero_solver_i.solve(normal_transpiration=vn)
+    pressures = aero_solver_i.panel_pressures(aero)
+    hydraulic_states = network_i.solve(
+        geom=geom_i,
+        panel_pressures=pressures,
+        aero_result=aero,
+        flow=flow_i,
+    )
+    q_pressure = np.asarray([float(state.Q) for state in hydraulic_states], dtype=float)
+    residual = (q_physical - q_pressure) / q_scale
+
+    if not np.all(np.isfinite(residual)):
+        raise FloatingPointError("Non-finite pseudo-arclength residual.")
+    return residual
+
+
+def _pseudo_arclength_to_target(
+    model: PorousModelSpec,
+    airfoil_name: str,
+    chord: float,
+    n_panels: int,
+    reynolds_external: float,
+    rho_inf: float,
+    mu_inf: float,
+    p_inf: float,
+    coupling: CouplingConfig,
+    limits: GeometryLimits,
+    alpha0: float,
+    q0: np.ndarray,
+    alpha1: float,
+    q1: np.ndarray,
+    target_alpha: float,
+    original_target_result: MultiPassageResult,
+) -> tuple[MultiPassageResult, dict]:
+    """Trace the full-coupling branch through a possible fold.
+
+    Two already-converged points seed a secant tangent.  The augmented system is
+
+        R(Q, alpha) = 0
+        t . (z - z_predictor) = 0,
+
+    with z=[Q/(H Vinf), alpha/PAL_ALPHA_SCALE_DEG].  Pseudo-arclength points are
+    diagnostic continuation states only.  A physical sweep result is accepted
+    only after the exact requested alpha is solved again at lambda=1 and the
+    normal residual criterion is satisfied.
+    """
+    target_alpha = float(target_alpha)
+    alpha0 = float(alpha0)
+    alpha1 = float(alpha1)
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+
+    base_context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, alpha1, reynolds_external,
+        rho_inf, mu_inf, p_inf,
+    )
+    q_scale = _q_scale_for_context(base_context[4], base_context[0])
+    if q0.shape != q_scale.shape or q1.shape != q_scale.shape:
+        metadata = {"attempted": False, "reason": "seed_shape_mismatch"}
+        return original_target_result, metadata
+
+    z_prev = np.concatenate((q0 / q_scale, [alpha0 / PAL_ALPHA_SCALE_DEG]))
+    z_curr = np.concatenate((q1 / q_scale, [alpha1 / PAL_ALPHA_SCALE_DEG]))
+    secant = z_curr - z_prev
+    secant_norm = float(np.linalg.norm(secant))
+    if not np.isfinite(secant_norm) or secant_norm <= 1.0e-14:
+        metadata = {"attempted": False, "reason": "degenerate_seed_secant"}
+        return original_target_result, metadata
+
+    tangent = secant / secant_norm
+    desired_alpha_direction = np.sign(target_alpha - alpha1)
+    if desired_alpha_direction != 0.0 and tangent[-1] * desired_alpha_direction < 0.0:
+        tangent = -tangent
+
+    ds = float(PAL_INITIAL_DS)
+    branch_points: list[tuple[float, np.ndarray]] = [
+        (alpha0, q0.copy()),
+        (alpha1, q1.copy()),
+    ]
+    stages: list[str] = []
+    fold_detected = False
+    best_distance = abs(alpha1 - target_alpha)
+    best_q = q1.copy()
+    previous_alpha = alpha1
+
+    target_context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, target_alpha, reynolds_external,
+        rho_inf, mu_inf, p_inf,
+    )
+
+    for step_id in range(1, PAL_MAX_STEPS + 1):
+        z_predictor = z_curr + ds * tangent
+
+        def augmented_residual(z: np.ndarray) -> np.ndarray:
+            z = np.asarray(z, dtype=float)
+            q_dim = z[:-1]
+            alpha_trial = float(z[-1] * PAL_ALPHA_SCALE_DEG)
+            if not np.isfinite(alpha_trial) or abs(alpha_trial) > PAL_ALPHA_LIMIT_DEG:
+                return np.full(z.shape, 1.0e3, dtype=float)
+            physical_residual = _evaluate_coupled_residual_at_q_alpha(
+                model=model,
+                airfoil_name=airfoil_name,
+                chord=chord,
+                n_panels=n_panels,
+                alpha_deg=alpha_trial,
+                reynolds_external=reynolds_external,
+                rho_inf=rho_inf,
+                mu_inf=mu_inf,
+                p_inf=p_inf,
+                q_dimensionless=q_dim,
+            )
+            arc_residual = float(np.dot(z - z_predictor, tangent))
+            return np.concatenate((physical_residual, [arc_residual]))
+
+        best_z = None
+        best_norm = float("inf")
+        method = "none"
+
+        try:
+            rr = root(
+                augmented_residual,
+                z_predictor,
+                method="hybr",
+                options={
+                    "maxfev": max(500, int(coupling.max_iter)),
+                    "factor": 0.5,
+                    "xtol": 1.0e-10,
+                },
+            )
+            zr = np.asarray(rr.x, dtype=float)
+            if np.all(np.isfinite(zr)):
+                nr = float(np.max(np.abs(augmented_residual(zr))))
+                if nr < best_norm:
+                    best_z, best_norm, method = zr.copy(), nr, "PAL-HYBR"
+        except (FloatingPointError, OverflowError, ValueError, RuntimeError):
+            pass
+
+        if best_norm > PAL_CORRECTOR_TOL:
+            try:
+                lr = least_squares(
+                    augmented_residual,
+                    x0=z_predictor if best_z is None else best_z,
+                    method="trf",
+                    jac="3-point",
+                    x_scale="jac",
+                    ftol=1.0e-12,
+                    xtol=1.0e-12,
+                    gtol=1.0e-12,
+                    max_nfev=max(1500, 5 * int(coupling.max_iter)),
+                )
+                zl = np.asarray(lr.x, dtype=float)
+                if np.all(np.isfinite(zl)):
+                    nl = float(np.max(np.abs(augmented_residual(zl))))
+                    if nl < best_norm:
+                        best_z, best_norm, method = zl.copy(), nl, "PAL-TRF"
+            except (FloatingPointError, OverflowError, ValueError, RuntimeError):
+                pass
+
+        if best_z is None or best_norm > PAL_CORRECTOR_TOL:
+            stages.append(f"s={step_id}:corrector_fail(R={best_norm:.3e},ds={ds:.4g})")
+            ds *= 0.5
+            if ds < PAL_MIN_DS:
+                break
+            continue
+
+        z_new = best_z
+        alpha_new = float(z_new[-1] * PAL_ALPHA_SCALE_DEG)
+        q_new = z_new[:-1] * q_scale
+        stages.append(
+            f"s={step_id}:{method}:alpha={alpha_new:.6f},R={best_norm:.2e},ds={ds:.4g}"
+        )
+        branch_points.append((alpha_new, q_new.copy()))
+
+        # Detect a turn in alpha along the continuously oriented branch.
+        if desired_alpha_direction != 0.0:
+            if (alpha_new - previous_alpha) * desired_alpha_direction < -1.0e-8:
+                fold_detected = True
+
+        distance = abs(alpha_new - target_alpha)
+        if distance < best_distance:
+            best_distance = distance
+            best_q = q_new.copy()
+
+        crossed_target = (
+            (previous_alpha - target_alpha) * (alpha_new - target_alpha) <= 0.0
+            and abs(alpha_new - previous_alpha) > 1.0e-12
+        )
+        if crossed_target or distance <= PAL_TARGET_TOL_DEG:
+            target_try = _solve_full_coupling_with_cold_retry(
+                aero_solver=target_context[2],
+                network=target_context[4],
+                coupling=coupling,
+                limits=limits,
+                initial_q=q_new,
+            )
+            if target_try.converged:
+                target_try.solver_message = (
+                    "continuation=pseudo_arclength; "
+                    f"fold_detected={fold_detected}; "
+                    + ", ".join(stages)
+                    + " | " + target_try.solver_message
+                )
+                metadata = {
+                    "attempted": True,
+                    "fold_detected": fold_detected,
+                    "alpha_min": float(min(a for a, _ in branch_points)),
+                    "alpha_max": float(max(a for a, _ in branch_points)),
+                    "steps": len(branch_points) - 2,
+                    "reached_target": True,
+                }
+                return target_try, metadata
+
+        new_tangent = z_new - z_curr
+        new_norm = float(np.linalg.norm(new_tangent))
+        if not np.isfinite(new_norm) or new_norm <= 1.0e-14:
+            break
+        new_tangent /= new_norm
+        if float(np.dot(new_tangent, tangent)) < 0.0:
+            new_tangent = -new_tangent
+
+        z_prev = z_curr
+        z_curr = z_new
+        tangent = new_tangent
+        previous_alpha = alpha_new
+        ds = min(PAL_MAX_DS, ds * 1.2)
+
+    # One final exact-target attempt from the closest arclength point.
+    final_try = _solve_full_coupling_with_cold_retry(
+        aero_solver=target_context[2],
+        network=target_context[4],
+        coupling=coupling,
+        limits=limits,
+        initial_q=best_q,
+    )
+    if final_try.converged:
+        final_try.solver_message = (
+            "continuation=pseudo_arclength_nearest_seed; "
+            f"fold_detected={fold_detected}; "
+            + ", ".join(stages)
+            + " | " + final_try.solver_message
+        )
+        result = final_try
+        reached = True
+    else:
+        original_target_result.solver_message += (
+            " | pseudo-arclength diagnostic: "
+            f"fold_detected={fold_detected}, "
+            f"alpha_min={min(a for a, _ in branch_points):.6f}, "
+            f"alpha_max={max(a for a, _ in branch_points):.6f}, "
+            f"closest_to_target={best_distance:.6f} deg; "
+            + ", ".join(stages)
+        )
+        result = _prefer_result(original_target_result, final_try)
+        reached = bool(result.converged)
+
+    metadata = {
+        "attempted": True,
+        "fold_detected": fold_detected,
+        "alpha_min": float(min(a for a, _ in branch_points)),
+        "alpha_max": float(max(a for a, _ in branch_points)),
+        "steps": len(branch_points) - 2,
+        "reached_target": reached,
+    }
+    return result, metadata
+
+# =============================================================================
 # AOA SWEEP
 # =============================================================================
 def run_porous_aoa_sweep_for_model(
@@ -1746,56 +2779,217 @@ def run_porous_aoa_sweep_for_model(
     field_nx: int = 300,
     field_ny: int = 300,
 ) -> pd.DataFrame:
-    rows: list[dict[str, float]] = []
-    paraview_cases: list[dict[str, Path]] = []
-    paraview_alphas: list[float] = []
+    """Run one porous-model AoA sweep using robust continuation.
 
-    # Every AoA is solved as an independent physical case.  Do not carry the
-    # transpiration field from one angle into the next: near a hydraulic branch
-    # change, the previous-angle field can place the fixed-point iteration on an
-    # oscillatory/non-convergent path even though a zero-flow start converges.
+    Requested AoAs are solved from the point nearest zero outwards in two
+    independent branches.  A failed requested point is retried using, in order:
+    adaptive AoA continuation with boundary bracketing, Reynolds-number
+    continuation with boundary bracketing, coupling homotopy with boundary
+    bracketing, and finally pseudo-arclength continuation through a possible
+    AoA fold.  Only requested AoAs at the requested Reynolds number and
+    lambda=1 are written as converged results.
+    """
+    if alpha_step == 0.0:
+        raise ValueError("alpha_step must be non-zero.")
+
+    raw_alphas = np.arange(
+        alpha_start,
+        alpha_end + 0.1 * alpha_step,
+        alpha_step,
+        dtype=float,
+    )
+    requested_alphas = np.asarray(sorted(set(float(a) for a in raw_alphas)), dtype=float)
+    if requested_alphas.size == 0:
+        return pd.DataFrame()
 
     if export_paraview:
         if paraview_output_dir is None:
             raise ValueError("paraview_output_dir is required when export_paraview=True.")
-
         paraview_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"[ParaView] AoA sweep export folder: {paraview_output_dir}")
 
-    for alpha in np.arange(alpha_start, alpha_end + 0.1 * alpha_step, alpha_step):
-        alpha = float(alpha)
+    # Solve the requested point nearest alpha=0 first, then march independently
+    # toward positive and negative AoA.  This avoids carrying a high-load branch
+    # through zero from the negative end of the original sweep ordering.
+    anchor = float(requested_alphas[np.argmin(np.abs(requested_alphas))])
+    positive_branch = [float(a) for a in requested_alphas if a > anchor]
+    negative_branch = [float(a) for a in requested_alphas if a < anchor][::-1]
 
-        flow_i, geom_i, _, aero_solver_i = build_base_problem(
-            airfoil_name=airfoil_name,
-            chord=chord,
-            n_panels=n_panels,
-            aoa_deg=alpha,
-            reynolds_external=reynolds_external,
-            rho_inf=rho_inf,
-            mu_inf=mu_inf,
-            p_inf=p_inf,
+    solve_order: list[tuple[str, float]] = [("anchor", anchor)]
+    solve_order += [("positive", a) for a in positive_branch]
+    solve_order += [("negative", a) for a in negative_branch]
+
+    rows_by_alpha: dict[float, dict] = {}
+    paraview_records: dict[float, dict[str, Path]] = {}
+
+    branch_alpha: dict[str, float | None] = {
+        "positive": anchor,
+        "negative": anchor,
+    }
+    branch_q: dict[str, np.ndarray | None] = {
+        "positive": None,
+        "negative": None,
+    }
+
+    for branch, alpha in solve_order:
+        if branch == "anchor":
+            previous_alpha = None
+            initial_q = None
+        else:
+            previous_alpha = branch_alpha[branch]
+            initial_q = branch_q[branch]
+
+        flow_i, geom_i, aero_solver_i, solid_i, network_i = _build_coupled_case_context(
+            model, airfoil_name, chord, n_panels, alpha, reynolds_external,
+            rho_inf, mu_inf, p_inf,
         )
 
-        solid_i = aero_solver_i.solve()
-
-        network_i = build_network_from_model(
-            model=model,
-            span_width=SPAN_WIDTH,
-        )
-
-        # Primary solve: cold start for this AoA.  This reproduces the original
-        # sweep behaviour in which each angle is independent.
-        coupled_i = MultiPassageCoupledSolver(
+        coupled_i = _solve_full_coupling_with_cold_retry(
             aero_solver=aero_solver_i,
             network=network_i,
             coupling=coupling,
             limits=limits,
-        ).solve(verbose=False, initial_vn=None)
+            initial_q=initial_q,
+        )
+        continuation_used = "direct"
+        aoa_boundary_meta = {
+            "boundary_found": False,
+            "alpha_converged": float("nan"),
+            "alpha_failed": float("nan"),
+            "q_converged": None,
+            "stages": [],
+        }
+        pal_meta = {
+            "attempted": False,
+            "fold_detected": False,
+            "alpha_min": float("nan"),
+            "alpha_max": float("nan"),
+            "steps": 0,
+            "reached_target": False,
+        }
+
+        # 1) Adaptive AoA continuation + explicit converged/failed boundary bracket.
+        if (
+            not coupled_i.converged
+            and previous_alpha is not None
+            and initial_q is not None
+        ):
+            (
+                flow_try, geom_try, aero_try, solid_try, network_try, result_try,
+                aoa_boundary_meta,
+            ) = _adaptive_aoa_continuation_to_target(
+                model=model,
+                airfoil_name=airfoil_name,
+                chord=chord,
+                n_panels=n_panels,
+                previous_alpha=float(previous_alpha),
+                target_alpha=alpha,
+                reynolds_external=reynolds_external,
+                rho_inf=rho_inf,
+                mu_inf=mu_inf,
+                p_inf=p_inf,
+                coupling=coupling,
+                limits=limits,
+                previous_q=initial_q,
+                original_target_result=coupled_i,
+            )
+            if result_try.converged or result_try.residual_norm < coupled_i.residual_norm:
+                flow_i, geom_i, aero_solver_i, solid_i, network_i, coupled_i = (
+                    flow_try, geom_try, aero_try, solid_try, network_try, result_try
+                )
+            if coupled_i.converged:
+                continuation_used = "adaptive_aoa"
+
+        # 2) Reynolds-number continuation from Re=5e5 (or the target if lower).
+        if not coupled_i.converged and reynolds_external > RE_CONTINUATION_REFERENCE:
+            (
+                flow_try, geom_try, aero_try, solid_try, network_try, result_try
+            ) = _solve_with_reynolds_continuation(
+                model=model,
+                airfoil_name=airfoil_name,
+                chord=chord,
+                n_panels=n_panels,
+                alpha_deg=alpha,
+                target_reynolds=reynolds_external,
+                rho_inf=rho_inf,
+                mu_inf=mu_inf,
+                p_inf=p_inf,
+                coupling=coupling,
+                limits=limits,
+                initial_q=initial_q,
+                original_target_result=coupled_i,
+            )
+            if result_try.converged or result_try.residual_norm < coupled_i.residual_norm:
+                flow_i, geom_i, aero_solver_i, solid_i, network_i, coupled_i = (
+                    flow_try, geom_try, aero_try, solid_try, network_try, result_try
+                )
+            if coupled_i.converged:
+                continuation_used = "reynolds"
+
+        # 3) Coupling homotopy lambda: 0 -> 1 at the true target alpha and Re.
+        if not coupled_i.converged:
+            homotopy_result = _solve_with_coupling_homotopy(
+                aero_solver=aero_solver_i,
+                network=network_i,
+                coupling=coupling,
+                limits=limits,
+                initial_q=initial_q,
+                original_full_result=coupled_i,
+            )
+            coupled_i = _prefer_result(coupled_i, homotopy_result)
+            if coupled_i.converged:
+                continuation_used = "coupling_homotopy"
+
+        # 4) Pseudo-arclength continuation through a possible AoA fold.
+        # This is attempted only when ordinary AoA continuation has established
+        # a converged/failed boundary bracket.  The branch trace itself is
+        # diagnostic; the requested case is accepted only after an exact
+        # lambda=1 target-alpha solve satisfies the original residual criterion.
+        if (
+            not coupled_i.converged
+            and previous_alpha is not None
+            and initial_q is not None
+            and bool(aoa_boundary_meta.get("boundary_found", False))
+            and aoa_boundary_meta.get("q_converged") is not None
+        ):
+            pal_result, pal_meta = _pseudo_arclength_to_target(
+                model=model,
+                airfoil_name=airfoil_name,
+                chord=chord,
+                n_panels=n_panels,
+                reynolds_external=reynolds_external,
+                rho_inf=rho_inf,
+                mu_inf=mu_inf,
+                p_inf=p_inf,
+                coupling=coupling,
+                limits=limits,
+                alpha0=float(previous_alpha),
+                q0=np.asarray(initial_q, dtype=float),
+                alpha1=float(aoa_boundary_meta["alpha_converged"]),
+                q1=np.asarray(aoa_boundary_meta["q_converged"], dtype=float),
+                target_alpha=alpha,
+                original_target_result=coupled_i,
+            )
+            coupled_i = _prefer_result(coupled_i, pal_result)
+            if coupled_i.converged:
+                continuation_used = "pseudo_arclength"
+
+        # Update only the branch that this point belongs to, and only after a
+        # genuine target-state root has been found.
+        if coupled_i.converged:
+            q_converged = _result_flow_vector(coupled_i)
+            if branch == "anchor":
+                branch_alpha["positive"] = alpha
+                branch_alpha["negative"] = alpha
+                branch_q["positive"] = q_converged
+                branch_q["negative"] = None if q_converged is None else q_converged.copy()
+            else:
+                branch_alpha[branch] = alpha
+                branch_q[branch] = q_converged
 
         if coupled_i.converged and export_paraview and paraview_output_dir is not None:
             alpha_dir = paraview_output_dir / _alpha_directory_name(alpha)
-
-            exported_files = export_paraview_files(
+            paraview_records[alpha] = export_paraview_files(
                 output_dir=alpha_dir,
                 network=network_i,
                 geom=geom_i,
@@ -1807,9 +3001,6 @@ def run_porous_aoa_sweep_for_model(
                 include_solid_exports=True,
                 collection_name="paraview_results.pvd",
             )
-
-            paraview_cases.append(exported_files)
-            paraview_alphas.append(alpha)
 
         if coupled_i.converged:
             row = {
@@ -1829,13 +3020,12 @@ def run_porous_aoa_sweep_for_model(
                 "max_abs_q_per_unit_span_m2_s": max(abs(float(s.Q)) for s in coupled_i.passage_states),
                 "sum_abs_q_per_unit_span_m2_s": sum(abs(float(s.Q)) for s in coupled_i.passage_states),
                 "max_dp_total_Pa": max(float(s.dp_total) for s in coupled_i.passage_states),
-                "max_internal_reynolds_equivalent": max(
-                    float(s.reynolds_equivalent) for s in coupled_i.passage_states
-                ),
+                "max_internal_reynolds_equivalent": max(float(s.reynolds_equivalent) for s in coupled_i.passage_states),
                 "max_vn_m_s": float(coupled_i.max_vn),
                 "coupling_converged": True,
                 "coupling_iterations": int(coupled_i.iterations),
                 "max_vn_over_vinf": float(coupled_i.max_vn_over_vinf),
+                "continuation_method": continuation_used,
             }
         else:
             nan = float("nan")
@@ -1861,22 +3051,48 @@ def run_porous_aoa_sweep_for_model(
                 "coupling_converged": False,
                 "coupling_iterations": int(coupled_i.iterations),
                 "max_vn_over_vinf": nan,
+                "continuation_method": "failed_after_all_continuation",
             }
 
+        row.update({
+            "aoa_boundary_found": bool(aoa_boundary_meta.get("boundary_found", False)),
+            "aoa_boundary_converged_deg": float(aoa_boundary_meta.get("alpha_converged", float("nan"))),
+            "aoa_boundary_failed_deg": float(aoa_boundary_meta.get("alpha_failed", float("nan"))),
+            "pseudo_arclength_attempted": bool(pal_meta.get("attempted", False)),
+            "pseudo_arclength_fold_detected": bool(pal_meta.get("fold_detected", False)),
+            "pseudo_arclength_alpha_min_deg": float(pal_meta.get("alpha_min", float("nan"))),
+            "pseudo_arclength_alpha_max_deg": float(pal_meta.get("alpha_max", float("nan"))),
+            "pseudo_arclength_steps": int(pal_meta.get("steps", 0)),
+            "pseudo_arclength_reached_target": bool(pal_meta.get("reached_target", False)),
+        })
         row.update(coupling_diagnostics(coupled_i))
-        rows.append(row)
-        if not coupled_i.converged:
-            print(f"[Case] alpha={alpha:g} deg, H={1000*representative_channel_height(model):g} mm: "
-                  f"{coupled_i.coupling_status}; residual={coupled_i.residual_norm:.3e}; "
-                  f"{coupled_i.solver_message}")
+        rows_by_alpha[alpha] = row
 
-    if export_paraview and paraview_output_dir is not None and paraview_cases:
+        height_mm = 1000.0 * representative_channel_height(model)
+        if coupled_i.converged:
+            print(
+                f"[Case] alpha={alpha:g} deg, H={height_mm:g} mm: "
+                f"converged; method={continuation_used}; "
+                f"CL={coupled_i.aero_result.CL:.8f}; "
+                f"residual={coupled_i.residual_norm:.3e}; "
+                f"evaluations={coupled_i.function_evaluations}"
+            )
+        else:
+            print(
+                f"[Case] alpha={alpha:g} deg, H={height_mm:g} mm: "
+                f"{coupled_i.coupling_status}; residual={coupled_i.residual_norm:.3e}; "
+                f"all continuation methods exhausted; {coupled_i.solver_message}"
+            )
+
+    if export_paraview and paraview_output_dir is not None and paraview_records:
+        exported_alphas = sorted(paraview_records)
         export_aoa_sweep_collections(
             output_dir=paraview_output_dir,
-            cases=paraview_cases,
-            alpha_values=paraview_alphas,
+            cases=[paraview_records[a] for a in exported_alphas],
+            alpha_values=exported_alphas,
         )
 
+    rows = [rows_by_alpha[float(a)] for a in requested_alphas if float(a) in rows_by_alpha]
     return pd.DataFrame(rows)
 
 

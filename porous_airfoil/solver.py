@@ -194,8 +194,7 @@ class CouplingConfig:
 
     max_iter: int = 10000
 
-def generate_naca4(airfoil_str, n_points=100): # or whatever the parameter name is
-    code = str(code).lower().replace("naca", "").replace(" ", "").replace("-", "").strip()
+
 # =============================================================================
 # GEOMETRY HELPERS
 # =============================================================================
@@ -221,10 +220,7 @@ def generate_naca4(
     tuple[np.ndarray, np.ndarray]
         Closed airfoil boundary coordinates `(XB, YB)`.
     """
-    # Sanitize 'airfoil_name' into 4-digit 'code'
     code = str(airfoil_name).lower().replace("naca", "").replace(" ", "").replace("-", "").strip()
-    
-    # Validate the sanitized 'code', not 'airfoil_name'
     if len(code) != 4 or not code.isdigit():
         raise ValueError("Only NACA 4-digit airfoils are supported.")
     if n_panels < 10:
@@ -232,9 +228,9 @@ def generate_naca4(
     if chord <= 0.0:
         raise ValueError("chord must be positive.")
 
-    m = int(airfoil_name[0]) / 100.0
-    p = int(airfoil_name[1]) / 10.0
-    t = int(airfoil_name[2:]) / 100.0
+    m = int(code[0]) / 100.0
+    p = int(code[1]) / 10.0
+    t = int(code[2:]) / 100.0
 
     beta = np.linspace(0.0, np.pi, n_panels // 2 + 1)
     x = 0.5 * (1.0 - np.cos(beta))
@@ -583,6 +579,9 @@ class SPVPResult:
     system_residual_norm: float
     kutta_residual: float
     normal_bc_residual_max: float
+    # Prescribed exterior normal velocity. Retained for the inlet/jet energy
+    # closure; the outlet jet velocity is a separate q/H state in porous.py.
+    Vn: np.ndarray | None = None
 
 
 class SourceVortexPanelMethod:
@@ -723,6 +722,7 @@ class SourceVortexPanelMethod:
             normal_bc_residual_max=float(
                 np.max(np.abs(system_residual[:-1]))
             ),
+            Vn=vn.copy(),
         )
 
     def panel_pressures(self, result: SPVPResult) -> np.ndarray:

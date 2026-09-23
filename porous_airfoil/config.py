@@ -146,7 +146,7 @@ CHORD = 1.0
 N_PANELS = 1000
 
 # External flow condition.
-REYNOLDS_EXTERNAL = 5.0e5
+REYNOLDS_EXTERNAL = 1.0e6
 AOA_DEG = 4.0
 
 # Fluid properties.
