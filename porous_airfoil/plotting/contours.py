@@ -33,6 +33,9 @@ Main outputs:
 
 from __future__ import annotations
 
+from .. import config as settings
+from ..reporting import timed_stage, aerodynamic_change_metrics, print_case_metrics, report_aerodynamic_frame
+
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -72,37 +75,25 @@ from ..porous import (
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-FINAL_CONTOUR_AOA_DEG = 10.0
-FINAL_CONTOUR_PORE_DIAMETER_M = 0.0080
+FINAL_CONTOUR_AOA_DEG = settings.PLOT_CONTOUR_FINAL_CONTOUR_AOA_DEG
+FINAL_CONTOUR_PORE_DIAMETER_M = settings.PLOT_CONTOUR_FINAL_CONTOUR_PORE_DIAMETER_M
 
-FINAL_CONTOUR_MODEL_NAMES = (
-    "model_1_4_chordwise",
-    "model_2_9_perpendicular",
-    "model_3_combined_independent",
-)
+FINAL_CONTOUR_MODEL_NAMES = settings.PLOT_CONTOUR_FINAL_CONTOUR_MODEL_NAMES
 
-MODEL_LABELS = {
-    "model_1_4_chordwise": "Horizontal",
-    "model_2_9_perpendicular": "Vertical",
-    "model_3_combined_independent": "Horizontal & Vertical",
-}
+MODEL_LABELS = settings.PLOT_CONTOUR_MODEL_LABELS
 
-MODEL_FOLDER_NAMES = {
-    "model_1_4_chordwise": "horizontal",
-    "model_2_9_perpendicular": "vertical",
-    "model_3_combined_independent": "Horizontal & Vertical",
-}
+MODEL_FOLDER_NAMES = settings.PLOT_CONTOUR_MODEL_FOLDER_NAMES
 
-OUTPUT_SUBDIR = "difference_contours"
-FINAL_CONTOUR_OUTPUT_ROOT = Path(OUTPUT_ROOT) / OUTPUT_SUBDIR
+OUTPUT_SUBDIR = settings.PLOT_CONTOUR_OUTPUT_SUBDIR
+FINAL_CONTOUR_OUTPUT_ROOT = settings.PLOT_CONTOUR_FINAL_CONTOUR_OUTPUT_ROOT
 
-SAVE_FORMATS = ("png", "pdf", "svg")
-PNG_DPI = 1000
+SAVE_FORMATS = settings.PLOT_CONTOUR_SAVE_FORMATS
+PNG_DPI = settings.PLOT_CONTOUR_PNG_DPI
 
-FIELD_NX = int(CONTOUR_NX)
-FIELD_NY = int(CONTOUR_NY)
+FIELD_NX = settings.PLOT_CONTOUR_FIELD_NX
+FIELD_NY = settings.PLOT_CONTOUR_FIELD_NY
 
-VERBOSE_COUPLING = True
+VERBOSE_COUPLING = settings.PLOT_CONTOUR_VERBOSE_COUPLING
 
 
 # =============================================================================
@@ -110,118 +101,85 @@ VERBOSE_COUPLING = True
 # =============================================================================
 # This cropped view makes the airfoil much larger in the final journal figure.
 # It is better than the wide far-field view for Results and Discussion figures.
-JOURNAL_XLIM = (-0.08, 1.08)
-JOURNAL_YLIM = (-0.20, 0.20)
+JOURNAL_XLIM = settings.PLOT_CONTOUR_JOURNAL_XLIM
+JOURNAL_YLIM = settings.PLOT_CONTOUR_JOURNAL_YLIM
 
 # Optional wider view for supplementary material.
-EXPORT_WIDE_SUPPORTING_VIEW = False
-WIDE_XLIM = (-0.50, 1.50)
-WIDE_YLIM = (-0.50, 0.50)
+EXPORT_WIDE_SUPPORTING_VIEW = settings.PLOT_CONTOUR_EXPORT_WIDE_SUPPORTING_VIEW
+WIDE_XLIM = settings.PLOT_CONTOUR_WIDE_XLIM
+WIDE_YLIM = settings.PLOT_CONTOUR_WIDE_YLIM
 
 # Main outputs.
-EXPORT_VELOCITY_PERCENT_DIFFERENCE = True
-EXPORT_PRESSURE_PA_DIFFERENCE = True
+EXPORT_VELOCITY_PERCENT_DIFFERENCE = settings.PLOT_CONTOUR_EXPORT_VELOCITY_PERCENT_DIFFERENCE
+EXPORT_PRESSURE_PA_DIFFERENCE = settings.PLOT_CONTOUR_EXPORT_PRESSURE_PA_DIFFERENCE
 
 # Additional pressure-contour set:
 # gauge pressure = porous static pressure - reference pressure.
-EXPORT_REFERENCE_SUBTRACTED_PRESSURE = True
-REFERENCE_PRESSURE_PA = 101325.0
+EXPORT_REFERENCE_SUBTRACTED_PRESSURE = settings.PLOT_CONTOUR_EXPORT_REFERENCE_SUBTRACTED_PRESSURE
+REFERENCE_PRESSURE_PA = settings.PLOT_CONTOUR_REFERENCE_PRESSURE_PA
 
-EXPORT_DELTA_CP_DIFFERENCE = True
-EXPORT_VELOCITY_MPS_DIFFERENCE = True
+EXPORT_DELTA_CP_DIFFERENCE = settings.PLOT_CONTOUR_EXPORT_DELTA_CP_DIFFERENCE
+EXPORT_VELOCITY_MPS_DIFFERENCE = settings.PLOT_CONTOUR_EXPORT_VELOCITY_MPS_DIFFERENCE
 
 # Recommended journal figure size.
 # Portrait 3 x 1 layout gives larger airfoils on the page.
-PORTRAIT_FIGSIZE = (6.9, 6.2)
-PORTRAIT_FIGSIZE_WIDE = (6.9, 7.1)
+PORTRAIT_FIGSIZE = settings.PLOT_CONTOUR_PORTRAIT_FIGSIZE
+PORTRAIT_FIGSIZE_WIDE = settings.PLOT_CONTOUR_PORTRAIT_FIGSIZE_WIDE
 
 # Use no figure suptitle for LaTeX papers.
 # Put the explanation in the caption instead.
-SHOW_FIGURE_SUPTITLE = False
+SHOW_FIGURE_SUPTITLE = settings.PLOT_CONTOUR_SHOW_FIGURE_SUPTITLE
 
 # Panel labels.
-PANEL_LABELS = ("(a)", "(b)", "(c)")
-PANEL_LABEL_X = 0.018
-PANEL_LABEL_Y = 0.875
+PANEL_LABELS = settings.PLOT_CONTOUR_PANEL_LABELS
+PANEL_LABEL_X = settings.PLOT_CONTOUR_PANEL_LABEL_X
+PANEL_LABEL_Y = settings.PLOT_CONTOUR_PANEL_LABEL_Y
 
 
 # =============================================================================
 # CONTOUR STYLE
 # =============================================================================
-DIFFERENCE_CMAP = "coolwarm"
-DIFFERENCE_LEVELS = 101
-SYMMETRIC_LIMIT_PERCENTILE = 99.3
-MIN_SYMMETRIC_LIMIT = 1.0e-12
+DIFFERENCE_CMAP = settings.PLOT_CONTOUR_DIFFERENCE_CMAP
+DIFFERENCE_LEVELS = settings.PLOT_CONTOUR_DIFFERENCE_LEVELS
+SYMMETRIC_LIMIT_PERCENTILE = settings.PLOT_CONTOUR_SYMMETRIC_LIMIT_PERCENTILE
+MIN_SYMMETRIC_LIMIT = settings.PLOT_CONTOUR_MIN_SYMMETRIC_LIMIT
 
 # Use one global limit across all three models for each field.
 # This is important for fair comparison.
-USE_COMMON_COLOUR_LIMITS = True
+USE_COMMON_COLOUR_LIMITS = settings.PLOT_CONTOUR_USE_COMMON_COLOUR_LIMITS
 
 # Optional manual colour limits. Set to None for automatic robust limits.
-MANUAL_VELOCITY_PERCENT_LIMIT = None
-MANUAL_PRESSURE_PA_LIMIT = None
-MANUAL_REFERENCE_SUBTRACTED_PRESSURE_LIMIT = None
-MANUAL_DELTA_CP_LIMIT = None
-MANUAL_VELOCITY_MPS_LIMIT = None
+MANUAL_VELOCITY_PERCENT_LIMIT = settings.PLOT_CONTOUR_MANUAL_VELOCITY_PERCENT_LIMIT
+MANUAL_PRESSURE_PA_LIMIT = settings.PLOT_CONTOUR_MANUAL_PRESSURE_PA_LIMIT
+MANUAL_REFERENCE_SUBTRACTED_PRESSURE_LIMIT = settings.PLOT_CONTOUR_MANUAL_REFERENCE_SUBTRACTED_PRESSURE_LIMIT
+MANUAL_DELTA_CP_LIMIT = settings.PLOT_CONTOUR_MANUAL_DELTA_CP_LIMIT
+MANUAL_VELOCITY_MPS_LIMIT = settings.PLOT_CONTOUR_MANUAL_VELOCITY_MPS_LIMIT
 
 
 # =============================================================================
 # AIRFOIL AND NETWORK STYLE
 # =============================================================================
-AIRFOIL_FACE_COLOR = "white"
-AIRFOIL_EDGE_COLOR = "black"
-AIRFOIL_EDGE_WIDTH = 0.90
+AIRFOIL_FACE_COLOR = settings.PLOT_CONTOUR_AIRFOIL_FACE_COLOR
+AIRFOIL_EDGE_COLOR = settings.PLOT_CONTOUR_AIRFOIL_EDGE_COLOR
+AIRFOIL_EDGE_WIDTH = settings.PLOT_CONTOUR_AIRFOIL_EDGE_WIDTH
 
-DRAW_INTERNAL_NETWORK = True
-NETWORK_CHANNEL_COLOR = "#222222"
-NETWORK_CHANNEL_LINEWIDTH = 0.62
-NETWORK_CHANNEL_ALPHA = 0.78
+DRAW_INTERNAL_NETWORK = settings.PLOT_CONTOUR_DRAW_INTERNAL_NETWORK
+NETWORK_CHANNEL_COLOR = settings.PLOT_CONTOUR_NETWORK_CHANNEL_COLOR
+NETWORK_CHANNEL_LINEWIDTH = settings.PLOT_CONTOUR_NETWORK_CHANNEL_LINEWIDTH
+NETWORK_CHANNEL_ALPHA = settings.PLOT_CONTOUR_NETWORK_CHANNEL_ALPHA
 
-DRAW_PORE_MARKERS = False
-NETWORK_PORE_FACE_COLOR = "white"
-NETWORK_PORE_EDGE_COLOR = "black"
-NETWORK_PORE_SIZE = 8.0
+DRAW_PORE_MARKERS = settings.PLOT_CONTOUR_DRAW_PORE_MARKERS
+NETWORK_PORE_FACE_COLOR = settings.PLOT_CONTOUR_NETWORK_PORE_FACE_COLOR
+NETWORK_PORE_EDGE_COLOR = settings.PLOT_CONTOUR_NETWORK_PORE_EDGE_COLOR
+NETWORK_PORE_SIZE = settings.PLOT_CONTOUR_NETWORK_PORE_SIZE
 
 
 # =============================================================================
 # PLOT STYLE
 # =============================================================================
 def apply_publication_style() -> None:
-    """Apply clean journal-style Matplotlib settings."""
-    mpl.rcParams.update(
-        {
-            "figure.dpi": 160,
-            "savefig.dpi": PNG_DPI,
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "DejaVu Sans"],
-            "mathtext.fontset": "custom",
-            "mathtext.rm": "Arial",
-            "mathtext.it": "Arial:italic",
-            "mathtext.bf": "Arial:bold",
-            "axes.linewidth": 0.85,
-            "axes.labelsize": 10.2,
-            "axes.titlesize": 10.2,
-            "xtick.labelsize": 9.3,
-            "ytick.labelsize": 9.3,
-            "legend.fontsize": 8.8,
-            "figure.titlesize": 11.2,
-            "xtick.direction": "in",
-            "ytick.direction": "in",
-            "xtick.top": True,
-            "ytick.right": True,
-            "xtick.major.size": 3.8,
-            "ytick.major.size": 3.8,
-            "xtick.minor.size": 2.0,
-            "ytick.minor.size": 2.0,
-            "xtick.major.width": 0.78,
-            "ytick.major.width": 0.78,
-            "xtick.minor.width": 0.62,
-            "ytick.minor.width": 0.62,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-        }
-    )
+    """Use the central Matplotlib style configuration."""
+    mpl.rcParams.update(settings.PLOT_CONTOUR_RCPARAMS)
 
 
 # =============================================================================
@@ -1049,6 +1007,7 @@ def run_one_final_contour_model(
     combined_cases: list[CombinedContourCase],
 ) -> dict:
     """Solve one porous model and store its difference fields."""
+    case_started = time.perf_counter()
     label = model_label(model.name)
     folder_name = model_folder_name(model.name)
 
@@ -1102,6 +1061,12 @@ def run_one_final_contour_model(
             "elapsed_seconds": float(elapsed),
         }
 
+        summary.update(aerodynamic_change_metrics(solid_result, coupled.aero_result, coupled.converged))
+        summary["channel_height_m"] = representative_pore_diameter(model)
+        summary["solve_elapsed_seconds"] = elapsed
+        summary["elapsed_seconds"] = time.perf_counter()-case_started
+        if settings.PRINT_METRICS_PER_CASE:
+            print_case_metrics(summary, model.name)
         write_csv(model_dir / "final_contour_case_summary.csv", summary)
         return summary
 
@@ -1163,9 +1128,7 @@ def run_one_final_contour_model(
         "porous_CM": float(coupled.aero_result.CM),
         "delta_CL": float(coupled.aero_result.CL - solid_result.CL),
         "delta_CM": float(coupled.aero_result.CM - solid_result.CM),
-        "gain_percent_vs_solid_panel": float(
-            100.0 * (coupled.aero_result.CL / solid_result.CL - 1.0)
-        ),
+
         "coupling_converged": True,
         "coupling_iterations": int(coupled.iterations),
         "max_vn_m_s": float(coupled.max_vn),
@@ -1173,6 +1136,12 @@ def run_one_final_contour_model(
         "elapsed_seconds": float(elapsed),
     }
 
+    summary.update(aerodynamic_change_metrics(solid_result, coupled.aero_result, coupled.converged))
+    summary["channel_height_m"] = representative_pore_diameter(model)
+    summary["solve_elapsed_seconds"] = elapsed
+    summary["elapsed_seconds"] = time.perf_counter()-case_started
+    if settings.PRINT_METRICS_PER_CASE:
+        print_case_metrics(summary, model.name)
     write_csv(model_dir / "final_contour_case_summary.csv", summary)
 
     return summary
@@ -1181,7 +1150,11 @@ def run_one_final_contour_model(
 # =============================================================================
 # MAIN
 # =============================================================================
+@timed_stage("contours")
 def main() -> None:
+    if not (settings.ENABLE_PLOTS and settings.RUN_CONTOURS):
+        print("[Skip] contours disabled in config.py.")
+        return {"status": "skipped", "message": "disabled in config.py"}
     apply_publication_style()
 
     aoa_label = format_float_label(FINAL_CONTOUR_AOA_DEG, decimals=2)
@@ -1257,6 +1230,8 @@ def main() -> None:
         combined_cases=combined_cases,
         output_root=output_root,
     )
+
+    report_aerodynamic_frame(pd.DataFrame(summary_rows), output_root, "contour_aerodynamic_change_metrics")
 
     combined_summary_path = output_root / "all_final_contour_cases_summary.csv"
     write_csv(combined_summary_path, summary_rows)

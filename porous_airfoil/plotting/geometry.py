@@ -19,6 +19,9 @@ the airfoil geometry and porous-network model definitions, then exports their
 
 from __future__ import annotations
 
+from .. import config as settings
+from ..reporting import timed_stage, aerodynamic_change_metrics, print_case_metrics, report_aerodynamic_frame
+
 from pathlib import Path
 import os
 
@@ -52,92 +55,51 @@ from ..porous import (
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-EXPORT_AOA_DEG = 4.0
-EXPORT_PORE_DIAMETER_M = 0.0090
+EXPORT_AOA_DEG = settings.PLOT_GEOMETRY_EXPORT_AOA_DEG
+EXPORT_PORE_DIAMETER_M = settings.PLOT_GEOMETRY_EXPORT_PORE_DIAMETER_M
 
-MODELS_TO_EXPORT = (
-    "model_1_4_chordwise",
-    "model_2_9_perpendicular",
-    "model_3_combined_independent",
-)
+MODELS_TO_EXPORT = settings.PLOT_GEOMETRY_MODELS_TO_EXPORT
 
-MODEL_LABELS = {
-    "model_1_4_chordwise": "Model 1: Horizontal channels",
-    "model_2_9_perpendicular": "Model 2: Vertical channels",
-    "model_3_combined_independent": "Model 3: Isotropic channels",
-}
+MODEL_LABELS = settings.PLOT_GEOMETRY_MODEL_LABELS
 
-MODEL_SHORT_LABELS = {
-    "model_1_4_chordwise": "Horizontal",
-    "model_2_9_perpendicular": "Vertical",
-    "model_3_combined_independent": "Isotropic",
-}
+MODEL_SHORT_LABELS = settings.PLOT_GEOMETRY_MODEL_SHORT_LABELS
 
-MODEL_FOLDER_NAMES = {
-    "model_1_4_chordwise": "model_1_horizontal",
-    "model_2_9_perpendicular": "model_2_vertical",
-    "model_3_combined_independent": "model_3_isotropic",
-}
+MODEL_FOLDER_NAMES = settings.PLOT_GEOMETRY_MODEL_FOLDER_NAMES
 
-EXPORT_ROOT = Path(OUTPUT_ROOT) / "porous_models"
+EXPORT_ROOT = settings.PLOT_GEOMETRY_EXPORT_ROOT
 
-SAVE_FORMATS = ("png", "pdf", "svg")
-PNG_DPI = 1000
+SAVE_FORMATS = settings.PLOT_GEOMETRY_SAVE_FORMATS
+PNG_DPI = settings.PLOT_GEOMETRY_PNG_DPI
 
-FIGURE_XLIM = (-0.03, 1.03)
-FIGURE_YLIM = (-0.16, 0.16)
+FIGURE_XLIM = settings.PLOT_GEOMETRY_FIGURE_XLIM
+FIGURE_YLIM = settings.PLOT_GEOMETRY_FIGURE_YLIM
 
-AIRFOIL_FACE_COLOR = "white"
-AIRFOIL_EDGE_COLOR = "black"
-AIRFOIL_EDGE_WIDTH = 1.00
+AIRFOIL_FACE_COLOR = settings.PLOT_GEOMETRY_AIRFOIL_FACE_COLOR
+AIRFOIL_EDGE_COLOR = settings.PLOT_GEOMETRY_AIRFOIL_EDGE_COLOR
+AIRFOIL_EDGE_WIDTH = settings.PLOT_GEOMETRY_AIRFOIL_EDGE_WIDTH
 
-CHANNEL_COLOR = "#606060"
-CHANNEL_WIDTH = 0.95
-CHANNEL_ALPHA = 0.95
+CHANNEL_COLOR = settings.PLOT_GEOMETRY_CHANNEL_COLOR
+CHANNEL_WIDTH = settings.PLOT_GEOMETRY_CHANNEL_WIDTH
+CHANNEL_ALPHA = settings.PLOT_GEOMETRY_CHANNEL_ALPHA
 
-PORE_FACE_COLOR = "white"
-PORE_EDGE_COLOR = "black"
-PORE_EDGE_WIDTH = 0.55
+PORE_FACE_COLOR = settings.PLOT_GEOMETRY_PORE_FACE_COLOR
+PORE_EDGE_COLOR = settings.PLOT_GEOMETRY_PORE_EDGE_COLOR
+PORE_EDGE_WIDTH = settings.PLOT_GEOMETRY_PORE_EDGE_WIDTH
 
-SHOW_PORE_CIRCLES = True
-SHOW_PORE_CENTRES = True
-PORE_CENTRE_MARKER_SIZE = 5.0
+SHOW_PORE_CIRCLES = settings.PLOT_GEOMETRY_SHOW_PORE_CIRCLES
+SHOW_PORE_CENTRES = settings.PLOT_GEOMETRY_SHOW_PORE_CENTRES
+PORE_CENTRE_MARKER_SIZE = settings.PLOT_GEOMETRY_PORE_CENTRE_MARKER_SIZE
 
-SHOW_CHANNEL_LABELS = False
-SHOW_TITLES = True
+SHOW_CHANNEL_LABELS = settings.PLOT_GEOMETRY_SHOW_CHANNEL_LABELS
+SHOW_TITLES = settings.PLOT_GEOMETRY_SHOW_TITLES
 
 
 # =============================================================================
 # STYLE
 # =============================================================================
 def apply_publication_style() -> None:
-    """Apply a clean publication-style Matplotlib format."""
-    mpl.rcParams.update(
-        {
-            "figure.dpi": 160,
-            "savefig.dpi": PNG_DPI,
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "DejaVu Sans"],
-            "mathtext.fontset": "custom",
-            "mathtext.rm": "Arial",
-            "mathtext.it": "Arial:italic",
-            "mathtext.bf": "Arial:bold",
-            "axes.linewidth": 0.85,
-            "axes.labelsize": 10.5,
-            "axes.titlesize": 10.5,
-            "xtick.labelsize": 9.5,
-            "ytick.labelsize": 9.5,
-            "legend.fontsize": 8.5,
-            "figure.titlesize": 12.0,
-            "xtick.direction": "in",
-            "ytick.direction": "in",
-            "xtick.top": True,
-            "ytick.right": True,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-        }
-    )
+    """Use the central Matplotlib style configuration."""
+    mpl.rcParams.update(settings.PLOT_GEOMETRY_RCPARAMS)
 
 
 # =============================================================================
@@ -465,7 +427,11 @@ def plot_combined_models(geom, model_network_pairs: list[tuple]) -> None:
 # =============================================================================
 # MAIN
 # =============================================================================
+@timed_stage("geometry")
 def main() -> None:
+    if not (settings.ENABLE_PLOTS and settings.RUN_GEOMETRY):
+        print("[Skip] geometry disabled in config.py.")
+        return {"status": "skipped", "message": "disabled in config.py"}
     apply_publication_style()
     safe_mkdir(EXPORT_ROOT)
 

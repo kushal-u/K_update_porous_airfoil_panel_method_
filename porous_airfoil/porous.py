@@ -1,11 +1,24 @@
+# PAPER CROSS-REFERENCES -- labels from the supplied LaTeX methods
+# [subsec:interface_transfer] IndependentPassage opening geometry, pressure
+# integration and conservative transpiration.
+# [subsec:internal_hydraulics] scalar friction law and hydraulic inversion.
+# [subsec:coupled_solution] ReducedFlowProblem, analytical Jacobian, damped
+# Newton/TRF and continuation; [subsec:verification_outputs] full-model check.
+# Notation: state.Q and q_prime are q'_k [m^2/s]; q_abs is |q'_k|.
+# normal_map is the PAPER transfer matrix M; q_scale is diag(S)=H_k*V_inf.
+# PAPER MISMATCH: friction is smoothly blended over Re_h=2000..3000,
+# not switched abruptly at 2300. All comments describe the actual code.
+# This edition adds comments only; see methods_review.md and methods_checked.tex.
+
 from __future__ import annotations
 
 from pathlib import Path
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares, root
+from scipy.optimize import least_squares
 from .solver import (
     CouplingConfig,
     FlowConfig,
@@ -63,52 +76,38 @@ from .config import (
 )
 
 from .integrations.paraview import export_aoa_sweep_collections, export_paraview_files
-# =============================================================================
-# INTERNAL CHANNEL HYDRAULIC RESISTANCE
-# =============================================================================
-INTERNAL_RE_TRANSITION = 2300.0
-
-# Reduced interface model, not a resolved jet/mixing calculation.
-# Inlet direction follows the static-pressure difference. Inlet tangential
-# kinetic energy is dissipated (zero recovery). The separate bulk outlet jet
-# matches exterior static pressure and carries alpha_j*rho*(q'/H)^2/2.
-# Set "legacy_static" only for comparison with old results.
-CHANNEL_ENERGY_CLOSURE = "zero_tangential_recovery_jet"
-JET_KINETIC_ENERGY_FACTOR = 1.0  # uniform bulk jet; not a fitted loss coefficient
-
-# -----------------------------------------------------------------------------
-# NONLINEAR CONTINUATION SETTINGS
-# -----------------------------------------------------------------------------
-# These settings change only the numerical path used to reach the requested
-# physical state.  Every reported solution is still checked at the requested
-# AoA, Reynolds number and full coupling strength lambda=1.
-ADAPTIVE_AOA_MIN_STEP_DEG = 0.05
-RE_CONTINUATION_REFERENCE = 5.0e5
-RE_CONTINUATION_INITIAL_DIVISIONS = 5
-RE_CONTINUATION_MIN_STEP = 1.0e4
-HOMOTOPY_INITIAL_STEP = 0.20
-HOMOTOPY_MIN_STEP = 0.025
-
-# Branch-boundary refinement.  These tolerances control only how accurately a
-# loss-of-root boundary is bracketed; they do not relax the nonlinear root
-# acceptance criterion used for physical results.
-AOA_BOUNDARY_TOL_DEG = 0.01
-RE_BOUNDARY_TOL = 2.0e3
-HOMOTOPY_BOUNDARY_TOL = 2.0e-3
-
-# Pseudo-arclength continuation settings.  The arclength state contains the
-# dimensionless passage-flow vector plus alpha/PAL_ALPHA_SCALE_DEG.
-PAL_ALPHA_SCALE_DEG = 1.0
-PAL_INITIAL_DS = 0.05
-PAL_MIN_DS = 0.005
-PAL_MAX_DS = 0.20
-PAL_MAX_STEPS = 50
-PAL_CORRECTOR_TOL = 1.0e-8
-PAL_TARGET_TOL_DEG = 0.02
-PAL_ALPHA_LIMIT_DEG = 30.0
+from . import config as settings
+from .reporting import (timed_stage, aerodynamic_change_metrics, print_case_metrics,
+                        report_aerodynamic_frame)
+# Configuration is authoritative; restart after editing config.py.
+from .config import (
+    INTERNAL_RE_TRANSITION,
+    CHANNEL_ENERGY_CLOSURE,
+    JET_KINETIC_ENERGY_FACTOR,
+    ADAPTIVE_AOA_MIN_STEP_DEG,
+    RE_CONTINUATION_REFERENCE,
+    RE_CONTINUATION_INITIAL_DIVISIONS,
+    RE_CONTINUATION_MIN_STEP,
+    HOMOTOPY_INITIAL_STEP,
+    HOMOTOPY_MIN_STEP,
+    AOA_BOUNDARY_TOL_DEG,
+    RE_BOUNDARY_TOL,
+    HOMOTOPY_BOUNDARY_TOL,
+    PAL_ALPHA_SCALE_DEG,
+    PAL_INITIAL_DS,
+    PAL_MIN_DS,
+    PAL_MAX_DS,
+    PAL_MAX_STEPS,
+    PAL_CORRECTOR_TOL,
+    PAL_TARGET_TOL_DEG,
+    PAL_ALPHA_LIMIT_DEG,
+)
 
 
-
+# [subsec:internal_hydraulics; eq:channel_friction_factor -- paper mismatch]
+# The active model has a C1 cubic blend, absent from the uploaded equation:
+# w=0 for Re<=LOW; w=xi^2*(3-2*xi) for LOW<Re<HIGH; w=1 for Re>=HIGH.
+# Defaults are LOW=2000, HIGH=3000, read from config by the caller.
 def _smooth_transition_weight(
     reynolds: float,
     re_low: float = 2000.0,
@@ -141,14 +140,24 @@ def _rectangular_2d_pressure_drop_abs(
     if u <= 0.0:
         return 0.0, 0.0, float("inf"), "zero_flow"
 
+    # [eq:channel_velocity; eq:hydraulic_diameter; eq:channel_reynolds]
+    # u=|q'|/H; D_h=2H; Re_h=rho*u*(2H)/mu=2*rho*|q'|/mu.
     hydraulic_diameter = 2.0 * float(height)
     reynolds = rho * u * hydraulic_diameter / max(mu, 1.0e-30)
 
+    # [eq:channel_friction_factor; eq:turbulent_pressure_flow]
+    # Laminar and turbulent endpoint correlations match the paper. Their smooth
+    # interpolation below differs from its abrupt-switch piecewise equation.
     f_laminar = 96.0 / max(reynolds, 1.0e-30)
     f_turbulent = 0.3164 / max(reynolds, 1.0e-30) ** 0.25
-    blend = _smooth_transition_weight(reynolds)
+    re_low = settings.HYDRAULIC_TRANSITION_RE_LOW
+    re_high = settings.HYDRAULIC_TRANSITION_RE_HIGH
+    blend = _smooth_transition_weight(reynolds, re_low, re_high)
     friction_factor = (1.0 - blend) * f_laminar + blend * f_turbulent
 
+    # [eq:friction_drop; eq:laminar_pressure_flow; eq:laminar_resistance]
+    # dp_f=f_D*(L/D_h)*(rho/2)*u^2 >=0. At f_D=96/Re_h this reduces to
+    # dp_f=12*mu*L*|q'|/H^3. The earlier zero-flow return avoids 96/0.
     pressure_drop = (
         friction_factor
         * (length / hydraulic_diameter)
@@ -157,9 +166,9 @@ def _rectangular_2d_pressure_drop_abs(
         * u**2
     )
 
-    if reynolds <= 2000.0:
+    if reynolds <= re_low:
         model_name = "laminar_2d_rectangular_12muL_over_H3"
-    elif reynolds < 3000.0:
+    elif reynolds < re_high:
         model_name = "transition_2d_rectangular_smooth_blend"
     else:
         model_name = "turbulent_2d_rectangular_blasius"
@@ -170,6 +179,45 @@ def _rectangular_2d_pressure_drop_abs(
         float(friction_factor),
         model_name,
     )
+
+
+def _channel_head_slope(q_abs, flow, length, height, kinetic_factor=0.0):
+    """Analytical d(loss+jet head)/d|q'|, including transition derivatives.
+
+    The laminar limit is evaluated directly at zero; neither 96/Re nor a
+    numerical difference is used there.
+    """
+    q = abs(float(q_abs))
+    # [eq:residual_jacobian; eq:laminar_resistance]
+    # Hydraulic inverse derivative uses g'(Q), Q=|q'|, where
+    # g(Q)=dp_f(Q)+alpha_j*rho*Q^2/(2H^2). Laminar dp_f'=R'.
+    # Turbulent dp_f=K*Q^(7/4), so dp_f'=(7/4)*K*Q^(3/4).
+    # Within the transition interval, differentiate the cubic blend too:
+    # dp_f'=(1-w)*R' + w*dp_t' + w'*(dp_t-R'*Q).
+    resistance = 12.0*flow.mu_inf*length/height**3
+    re_slope = 2.0*flow.rho_inf/flow.mu_inf
+    re = re_slope*q
+    low = settings.HYDRAULIC_TRANSITION_RE_LOW
+    high = settings.HYDRAULIC_TRANSITION_RE_HIGH
+    if re <= low:
+        slope = resistance
+    else:
+        # Turbulent head is K q^(7/4). Avoid singular f_D at zero.
+        coefficient = (0.3164*re_slope**(-0.25)*length/(2.0*height)
+                       * 0.5*flow.rho_inf/height**2)
+        turbulent = coefficient*q**1.75
+        turbulent_slope = 1.75*coefficient*q**0.75
+        if re >= high:
+            slope = turbulent_slope
+        else:
+            xi = (re-low)/(high-low)
+            w = xi*xi*(3.0-2.0*xi)
+            dw = 6.0*xi*(1.0-xi)*re_slope/(high-low)
+            slope = ((1.0-w)*resistance + w*turbulent_slope
+                     + dw*(turbulent-resistance*q))
+    # [eq:channel_energy_equation; eq:residual_jacobian]
+    # Add derivative of the outlet jet head: alpha_j*rho*Q/H^2.
+    return float(slope + kinetic_factor*flow.rho_inf*q/height**2)
 
 
 def solve_rectangular_channel_flow(
@@ -217,6 +265,12 @@ def solve_rectangular_channel_flow(
 
     sign = 1.0 if dp >= 0.0 else -1.0
 
+    # [eq:channel_energy_equation]
+    # Scalar hydraulic inversion at FIXED available head: find u>=0 satisfying
+    # dp_f(H*u)+alpha_j*rho*u^2/2=|dp|, then q'=sign(dp)*H*u.
+    # Here the argument dp already includes the inlet normal head if enabled.
+    # This bracketing/bisection is separate from the simultaneous outer Newton
+    # solve for all channel flows. Friction/Re are recomputed at each u.
     # Bracket and solve the monotonic pressure-drop law in mean velocity.
     u_low = 0.0
     u_high = 1.0
@@ -262,6 +316,8 @@ def solve_rectangular_channel_flow(
     q_prime_abs = mean_velocity * height
     if outlet_kinetic_factor > 0.0:
         model_name += "+outlet_jet_kinetic_head"
+    # This returned equivalent resistance is available_head/|q'|.
+    # It includes jet head when enabled; it is not generally the friction R'.
     equivalent_resistance = dp_abs / max(q_prime_abs, 1.0e-30)
 
     if not all(
@@ -302,6 +358,10 @@ class IndependentPassage:
     def pore_surface_point(self, geom: PanelGeometry, pore: Pore) -> SurfacePoint:
         return geom.surface_point_from_fraction(pore.x_frac, pore.side)
 
+    # [subsec:internal_hydraulics]
+    # For all active horizontal/perpendicular layouts, L is the direct distance
+    # between surface endpoints. Other legacy layout kinds add half-thickness
+    # corrections; those helpers are not part of the three active paper models.
     def passage_length(self, geom: PanelGeometry) -> float:
         sp1 = self.pore_surface_point(geom, self.pore1)
         sp2 = self.pore_surface_point(geom, self.pore2)
@@ -387,6 +447,9 @@ class IndependentPassage:
                     f"height={self.chamber.height:.4e}, t_min={t_min:.4e}"
                 )
 
+    # [eq:channel_velocity; eq:hydraulic_diameter; eq:channel_reynolds]
+    # q_abs is a per-span flow. Re_h=2*rho*|q'|/mu: explicit H cancels for
+    # fixed q', although the solved q' itself depends on channel height.
     def equivalent_reynolds(self, q_abs: float, flow: FlowConfig) -> float:
         """Return Re based on q' per unit span and D_h=2H."""
         u_internal = q_abs / max(self.chamber.height, 1e-16)
@@ -398,6 +461,10 @@ class IndependentPassage:
         )
 
 
+    # [subsec:interface_transfer; eq:opening_length]
+    # Intersect the strip |(x-origin).transverse|<=H/2 with each straight panel;
+    # return exact polygonal overlap fractions t0,t1. Actual overlap length is
+    # ell_ik=(t1-t0)*S_i, not H or the whole panel length.
     def _opening_segments(
         self, geom: PanelGeometry, pore: Pore,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -490,6 +557,11 @@ class IndependentPassage:
         ids, t0, t1 = self._opening_segments(geom, pore)
         return ids, (t1-t0)*geom.S[ids]
 
+    # [eq:opening_pressure_average]
+    # pbar=integral_opening p(s) ds / ell. Reconstruction is linear through
+    # panel centres on the same surface and constant beyond endpoint centres.
+    # The same routine averages already-squared panel velocities for kinetic
+    # heads; it does not square the opening-average velocity.
     def _area_average_pressure_at_pore(
         self, geom: PanelGeometry, pore: Pore,
         panel_pressures: np.ndarray, min_panels: int = 0,
@@ -525,6 +597,52 @@ class IndependentPassage:
             opening_length += end-start
         return integral/opening_length
 
+    # [eq:opening_pressure_average; subsec:coupled_solution]
+    # Assemble W so pbar=W@p equals the independent reconstruction integral.
+    # These interpolation/integration weights are distinct from geometric
+    # overlaps used to conserve q'. Reduced quadratic pressures use W.
+    def _pressure_average_weights(self, geom, pore):
+        """Exact linear weights for the existing piecewise-linear p(s) integral.
+
+        This is a coefficient assembly only. The original integration above
+        remains independent and is used to verify the final coupled state.
+        """
+        cache = getattr(self, "_pressure_weight_cache", None)
+        if cache is None or cache[0] is not geom:
+            cache = (geom, {})
+            self._pressure_weight_cache = cache
+        key = (pore, self.pore1, self.pore2, self.chamber.height)
+        if key in cache[1]:
+            return cache[1][key]
+        ids, t0, t1 = self._opening_segments(geom, pore)
+        edges = np.r_[0.0, np.cumsum(geom.S)]
+        centres = 0.5*(edges[:-1]+edges[1:])
+        side = np.sort(geom.upper_panel_ids if pore.side == "upper"
+                       else geom.lower_panel_ids)
+        knots = centres[side]
+        weights = np.zeros(geom.num_pan)
+        opening_length = 0.0
+        for i, left, right in zip(ids, t0, t1):
+            start, end = edges[i]+left*geom.S[i], edges[i]+right*geom.S[i]
+            x = np.r_[start, knots[(knots > start) & (knots < end)], end]
+            node_weight = np.zeros(x.size)
+            node_weight[:-1] += 0.5*np.diff(x)
+            node_weight[1:] += 0.5*np.diff(x)
+            for location, weight in zip(x, node_weight):
+                j = int(np.searchsorted(knots, location))
+                if j == 0:
+                    weights[side[0]] += weight
+                elif j == len(knots):
+                    weights[side[-1]] += weight
+                else:
+                    fraction = (location-knots[j-1])/(knots[j]-knots[j-1])
+                    weights[side[j-1]] += weight*(1.0-fraction)
+                    weights[side[j]] += weight*fraction
+            opening_length += end-start
+        weights /= opening_length
+        cache[1][key] = weights
+        return weights
+
 
     def solve(
         self,
@@ -544,11 +662,14 @@ class IndependentPassage:
         This is a conservative reduced closure hypothesis; jet mixing and
         tangential recovery are not resolved or calibrated.
         """
+        # [eq:channel_energy_equation]
+        # dp=pbar1-pbar2 sets inlet/direction. The kinetic-head closure is enabled
+        # by zero_tangential_recovery_jet; legacy_static uses static dp alone.
         p1 = self._area_average_pressure_at_pore(geom, self.pore1, panel_pressures)
         p2 = self._area_average_pressure_at_pore(geom, self.pore2, panel_pressures)
         dp = p1 - p2
         length = self.passage_length(geom)
-        closure = CHANNEL_ENERGY_CLOSURE
+        closure = settings.CHANNEL_ENERGY_CLOSURE
         if closure not in {"legacy_static", "zero_tangential_recovery_jet"}:
             raise ValueError(f"Unknown CHANNEL_ENERGY_CLOSURE: {closure}")
         normal_head = tangential_head = 0.0
@@ -564,16 +685,25 @@ class IndependentPassage:
             # Same linear averaging operator for pressure and kinetic heads:
             # <p> + <rho*(Vt^2+Vn^2)/2> = p0_inf, up to roundoff.
             inlet = self.pore1 if dp >= 0.0 else self.pore2
+            # [eq:channel_energy_equation; eq:pressure_coefficient]
+            # Average panel values rho*Vn_i^2/2 with the SAME linear operator as p.
+            # Vn_i is the panel-average boundary velocity, not q'/ell on the open
+            # fraction and not the bulk internal/jet speed q'/H. This distinction
+            # matters where a mouth cuts a panel. Tangential head is diagnostic only.
             normal_head = self._area_average_pressure_at_pore(
                 geom, inlet, 0.5*flow.rho_inf*vn**2)
             tangential_head = self._area_average_pressure_at_pore(
                 geom, inlet, 0.5*flow.rho_inf*vt**2)
-            kinetic_factor = float(JET_KINETIC_ENERGY_FACTOR)
+            kinetic_factor = float(settings.JET_KINETIC_ENERGY_FACTOR)
             if not np.isfinite(kinetic_factor) or kinetic_factor < 1.0:
                 raise ValueError("JET_KINETIC_ENERGY_FACTOR must be finite and >= 1.")
 
         # This reduced pressure-driven model excludes inertia-driven flow against
         # the static-pressure gradient. At an exact tie it selects zero flow.
+        # [eq:channel_energy_equation -- pressure-tie convention]
+        # For nonzero dp: available=|dp|+normal_head, signed by static dp.
+        # At dp==0 the implementation explicitly imposes q_hyd=0 even if the
+        # normal head is nonzero; the energy equation needs this separate tie rule.
         direction = float(np.sign(dp))
         available_head = abs(dp) + normal_head if direction != 0.0 else 0.0
         q, _, reynolds, friction_factor, resistance_model = solve_rectangular_channel_flow(
@@ -584,6 +714,9 @@ class IndependentPassage:
             height=self.chamber.height,
             outlet_kinetic_factor=kinetic_factor,
         )
+        # [eq:channel_velocity; eq:friction_drop; eq:channel_energy_equation]
+        # Bulk speed U=|q'|/H; outlet head alpha_j*rho*U^2/2 is distinct from
+        # distributed friction. The following diagnostics are in Pa or W/m span.
         speed = abs(q)/self.chamber.height
         friction_head = _rectangular_2d_pressure_drop_abs(
             speed, flow.rho_inf, flow.mu_inf, length, self.chamber.height)[0]
@@ -643,6 +776,11 @@ class IndependentPassage:
         ids1, overlap1 = self._surface_patch_weights(geom, self.pore1)
         ids2, overlap2 = self._surface_patch_weights(geom, self.pore2)
 
+        # [eq:opening_length; eq:opening_velocity;
+        # eq:inlet_flow_conservation; eq:outlet_flow_conservation]
+        # ell_1=sum_i overlap1_i; ell_2=sum_i overlap2_i.
+        # Vn_i^(1)=-q'*ell_i1/(ell_1*S_i), Vn_i^(2)=+q'*ell_i2/(ell_2*S_i).
+        # Hence each signed opening sum(Vn_i*S_i) is exactly -q' or +q'.
         opening1 = max(float(np.sum(overlap1)), 1.0e-16)
         opening2 = max(float(np.sum(overlap2)), 1.0e-16)
 
@@ -656,6 +794,9 @@ class IndependentPassage:
 # =============================================================================
 # NETWORK OF INDEPENDENT CHANNELS
 # =============================================================================
+# [subsec:model_overview; eq:normal_velocity_map]
+# Channels have independent hydraulics (no junction pressure unknowns).
+# Their Vn contributions superpose; their flows couple through exterior p.
 class IndependentPassageNetwork:
     def __init__(self, passages: list[IndependentPassage]) -> None:
         if not passages:
@@ -752,415 +893,419 @@ class IndependentPassageNetwork:
 # =============================================================================
 # COUPLED PANEL + POROUS SOLVER
 # =============================================================================
-class MultiPassageCoupledSolver:
-    def __init__(
-        self,
-        aero_solver: SourceVortexPanelMethod,
-        network: IndependentPassageNetwork,
-        coupling: CouplingConfig,
-        limits: GeometryLimits,
-    ) -> None:
-        self.aero_solver = aero_solver
-        self.network = network
-        self.coupling = coupling
-        self.limits = limits
+class ReducedFlowProblem:
+    """Exact static condensation of the discretised aerodynamic equations.
 
-    def solve(
-        self,
-        verbose: bool = False,
-        initial_vn: np.ndarray | None = None,
-        initial_q: np.ndarray | None = None,
-        coupling_strength: float = 1.0,
-    ) -> MultiPassageResult:
-        """Solve the coupled pressure-flow equations as a nonlinear root problem.
+    z_k=q'_k/(H_k V_inf), u=[cos(alpha), sin(alpha), z]. Precompute
+    Vt=T u, Vn=N u and opening pressure perturbations u^T P_l u.
+    The unknown flow vector remains nonlinear; only the Newton corrections
+    are solved with a linear matrix. No Taylor truncation of Bernoulli is made.
 
-        Parameters
-        ----------
-        verbose
-            Print nonlinear residual evaluations.
-        initial_vn
-            Backward-compatible initial transpiration field.  It is used only
-            to construct an initial flow-rate guess.
-        initial_q
-            Preferred continuation seed: physical passage flow rates per unit
-            span [m^2/s].  Passing Q directly is robust when AoA or Reynolds
-            number changes because the solver rescales it using the new H*Vinf.
-        coupling_strength
-            Homotopy parameter lambda in [0,1].  The trial transpiration is
-            lambda times the physical Q-to-vn mapping.  lambda=1 is exactly the
-            original fully coupled model; lambda<1 is used only for numerical
-            continuation and must never be reported as a physical final state.
+    The original flow-mismatch residual is retained. Its Jacobian differentiates
+    the scalar hydraulic inverse implicitly, including f_D(Re) and transition.
+    Static-pressure inlet selection is piecewise smooth; derivatives are valid
+    on the selected branch, not across a finite-head pressure-tie discontinuity.
+    """
 
-        Notes
-        -----
-        The nonlinear unknown is the dimensionless passage-flow vector.  For a
-        trial Q the code maps Q to surface transpiration, solves the external
-        panel method, calculates opening pressures, obtains the pressure-driven
-        channel flows, and forms
+    def __init__(self, aero_solver, network, coupling_strength=1.0):
+        self.aero_solver, self.network = aero_solver, network
+        self.geom, self.flow = aero_solver.geom, aero_solver.flow
+        self.strength = float(coupling_strength)
+        if not np.isfinite(self.strength) or not 0.0 <= self.strength <= 1.0:
+            raise ValueError("coupling_strength must lie in [0, 1].")
+        self.closure = settings.CHANNEL_ENERGY_CLOSURE
+        if self.closure not in {"legacy_static", "zero_tangential_recovery_jet"}:
+            raise ValueError("Unsupported CHANNEL_ENERGY_CLOSURE.")
+        self.kinetic_factor = (float(settings.JET_KINETIC_ENERGY_FACTOR)
+                               if self.closure != "legacy_static" else 0.0)
+        if self.closure != "legacy_static" and (not np.isfinite(self.kinetic_factor)
+                                                or self.kinetic_factor < 1.0):
+            raise ValueError("JET_KINETIC_ENERGY_FACTOR must be finite and >= 1.")
+        self.heights = np.array([p.chamber.height for p in network.passages])
+        self.lengths = np.array([p.passage_length(self.geom) for p in network.passages])
+        # [eq:channel_flow_vector; eq:flow_scaling]
+        # q_scale=diag(S), S=V_inf*diag(H_k); q=S*z and z_k=q'_k/(H_k*V_inf).
+        self.q_scale = self.heights*self.flow.v_inf
+        self.size = len(self.heights)
+        # [eq:normal_velocity_map; eq:reduced_normal_velocity]
+        # Each column is the Vn response to q'_k=1, giving Vn=M*q.
+        # During homotopy only, Vn=chi*M*q with chi=coupling_strength; physical
+        # results use chi=1. chi is unrelated to source strengths lambda_i.
+        self.normal_map = np.column_stack([
+            p.transpiration_from_flow(self.geom, PassageState(1.0, 0, 0, 0, 0, 0))
+            for p in network.passages
+        ])
+        # [eq:precomputed_aerodynamic_responses; eq:strength_reconstruction;
+        # eq:reduced_tangential_velocity]
+        # strengths_q=X_q, tangent_q=T_q; freestream columns produce x_0,Vt_0.
+        # The following basis multiplies u=[cos(alpha),sin(alpha),z]. At chi=1,
+        # x=x_0+X_q*q, Vt=Vt_0+T_q*q, and Vn=M*q exactly.
+        strengths_q, tangent_q = aero_solver.linear_flow_response(self.normal_map)
+        strengths_inf, tangent_inf = aero_solver.freestream_response()
+        self.strength_basis = np.column_stack((
+            strengths_inf, strengths_q*(self.strength*self.q_scale)[None, :]))
+        tangent = np.column_stack((
+            tangent_inf, tangent_q*(self.strength*self.q_scale)[None, :]))
+        normal = np.column_stack((np.zeros((self.geom.num_pan, 2)),
+                                  self.normal_map*(self.strength*self.q_scale)[None, :]))
+        weights = np.array([
+            p._pressure_average_weights(self.geom, pore)
+            for p in network.passages for pore in (p.pore1, p.pore2)
+        ])
+        # [eq:pressure_coefficient; eq:panel_pressure; eq:opening_pressure_average]
+        # If Vt=T*u, Vn=N*u, define symmetric P_l=-rho/2*sum_i W_li
+        # *(T_i^T*T_i+N_i^T*N_i). Then pbar_l=p_inf+rho*V_inf^2/2+u^T*P_l*u.
+        # Normal-head tensors use +rho/2*sum_i W_li*N_i^T*N_i.
+        # This preserves all quadratic terms; no Bernoulli Taylor truncation.
+        rho_half = 0.5*self.flow.rho_inf
+        self.pressure_quadratic = -rho_half*(
+            np.einsum("li,ij,ik->ljk", weights, tangent, tangent, optimize=True)
+            + np.einsum("li,ij,ik->ljk", weights, normal, normal, optimize=True))
+        self.normal_quadratic = rho_half*np.einsum(
+            "li,ij,ik->ljk", weights, normal, normal, optimize=True)
+        self._last_key = None
+        self.evaluation_count = 0
 
-            R = (Q_trial - Q_pressure_driven) / (H V_inf).
+    def evaluate(self, z, alpha_deg=None):
+        """Return (R, dR/dz, dR/dalpha_radian) without a panel solve.
 
-        HYBR is tried with two step factors, followed by TRF least-squares.
-        Solver status alone is never accepted: convergence requires the original
-        scaled residual to satisfy the machine-resolution-based criterion.
+        At dp=0 the original model sets Q_hyd=0. If normal inlet head is also
+        zero, use its continuous laminar derivative. Otherwise the tie is
+        discontinuous: use a zero hydraulic branch derivative at the tie and
+        let the line search and original-residual acceptance handle the switch.
         """
-        geom = self.aero_solver.geom
-        flow = self.aero_solver.flow
-        n_passages = len(self.network.passages)
+        z = np.asarray(z, dtype=float)
+        if z.shape != (self.size,) or not np.all(np.isfinite(z)):
+            raise FloatingPointError("Invalid reduced flow state.")
+        alpha = self.flow.aoa_deg if alpha_deg is None else float(alpha_deg)
+        if not np.isfinite(alpha):
+            raise FloatingPointError("Invalid angle of attack.")
+        key = (z.tobytes(), alpha)
+        if key == self._last_key:
+            return self._last_value
+        angle = np.deg2rad(alpha)
+        u = np.r_[np.cos(angle), np.sin(angle), z]
+        du_da = np.r_[-np.sin(angle), np.cos(angle), np.zeros(self.size)]
+        # Gauge pressures omit the common p_inf+rho*V_inf^2/2. This avoids
+        # cancellation of atmospheric pressure in the reduced residual.
+        p = np.einsum("i,lij,j->l", u, self.pressure_quadratic, u)
+        # [eq:residual_jacobian]
+        # For a symmetric quadratic tensor, grad_u(u^T*P_l*u)=2*P_l*u.
+        # pg and hg are exact opening-pressure and normal-head derivatives.
+        pg = 2.0*np.einsum("lij,j->li", self.pressure_quadratic, u)
+        head = np.einsum("i,lij,j->l", u, self.normal_quadratic, u)
+        hg = 2.0*np.einsum("lij,j->li", self.normal_quadratic, u)
+        residual = z.copy()
+        jacobian = np.eye(self.size)
+        derivative_alpha = np.zeros(self.size)
+        self.q_hydraulic = np.zeros(self.size)
+        self.static_dp = p[::2]-p[1::2]
+        self.available_head = np.zeros(self.size)
+        self.pressure_ties = []
+        for k in range(self.size):
+            dp = self.static_dp[k]
+            dp_gradient = pg[2*k]-pg[2*k+1]
+            direction = float(np.sign(dp))
+            inlet = 2*k if direction >= 0.0 else 2*k+1
+            normal_head = head[inlet] if self.closure != "legacy_static" else 0.0
+            normal_gradient = hg[inlet] if self.closure != "legacy_static" else np.zeros(u.size)
+            available = abs(dp)+normal_head if direction != 0.0 else 0.0
+            q_hyd = solve_rectangular_channel_flow(
+                direction*available, self.flow.rho_inf, self.flow.mu_inf,
+                self.lengths[k], self.heights[k], self.kinetic_factor)[0]
+            slope = _channel_head_slope(
+                abs(q_hyd), self.flow, self.lengths[k], self.heights[k], self.kinetic_factor)
+            if not np.isfinite(slope) or slope <= 0.0:
+                raise FloatingPointError("Hydraulic inverse requires a positive finite slope.")
+            if direction != 0.0:
+                # [eq:residual_jacobian]
+                # On a fixed inlet branch s=sign(dp), g(Q)=|dp|+h_n, q_hyd=s*Q:
+                # dq_hyd/du = s*(s*d(dp)/du + dh_n/du)/g'(Q).
+                # g' includes the active cubic friction blend and the jet-head derivative.
+                q_gradient = direction*(direction*dp_gradient+normal_gradient)/slope
+            elif (self.closure == "legacy_static" or
+                  max(head[2*k], head[2*k+1]) <= 64.0*np.finfo(float).eps
+                  *max(1.0, self.flow.rho_inf*self.flow.v_inf**2)):
+                q_gradient = dp_gradient/slope
+            else:
+                self.pressure_ties.append(k)
+                q_gradient = np.zeros(u.size)
+            # [eq:coupled_residual; eq:residual_jacobian]
+            # R=z-S^-1*q_hyd; J_R=I-S^-1*(dq_hyd/dz).
+            # The alpha derivative below is per RADIAN for pseudo-arclength use.
+            residual[k] -= q_hyd/self.q_scale[k]
+            jacobian[k] -= q_gradient[2:]/self.q_scale[k]
+            derivative_alpha[k] = -np.dot(q_gradient, du_da)/self.q_scale[k]
+            self.q_hydraulic[k] = q_hyd
+            self.available_head[k] = available
+        if not all(np.all(np.isfinite(a)) for a in (residual, jacobian, derivative_alpha)):
+            raise FloatingPointError("Non-finite reduced residual or Jacobian.")
+        self.evaluation_count += 1
+        self._last_key = key
+        self._last_value = (residual, jacobian, derivative_alpha)
+        return self._last_value
 
-        coupling_strength = float(coupling_strength)
-        if not np.isfinite(coupling_strength) or not (0.0 <= coupling_strength <= 1.0):
-            raise ValueError("coupling_strength must be finite and lie in [0, 1].")
+    def residual_and_jacobian(self, z):
+        residual, jacobian, _ = self.evaluate(z)
+        return residual, jacobian
+
+
+@dataclass
+class _NewtonOutcome:
+    x: np.ndarray
+    residual_norm: float
+    converged: bool
+    iterations: int
+    evaluations: int
+    condition_number: float
+    smallest_singular_value: float
+    method: str
+    message: str
+
+
+def _damped_newton(evaluate, initial, coupling, tolerance=None, verbose=False):
+    """Small dense Newton system with line search and analytical-Jacobian TRF.
+
+    evaluate(x) supplies the ORIGINAL residual and its consistent Jacobian.
+    A least-squares stationary point never passes without a small residual.
+    """
+    x = np.asarray(initial, dtype=float).copy()
+    best_x = x.copy()
+    best_norm = float("inf")
+    calls, iterations = 0, 0
+    condition, smallest = float("nan"), float("nan")
+    method, message = "reduced_newton", "iteration limit reached"
+    last_x, last_value = None, None
+
+    def checked(value):
+        nonlocal calls, best_x, best_norm, last_x, last_value
+        if last_x is not None and np.array_equal(value, last_x):
+            return last_value
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            r, j = evaluate(value)
+        if not np.all(np.isfinite(r)) or not np.all(np.isfinite(j)):
+            raise FloatingPointError("Non-finite nonlinear residual or Jacobian.")
+        calls += 1
+        norm = float(np.linalg.norm(r, np.inf))
+        if norm < best_norm:
+            best_x, best_norm = np.array(value, copy=True), norm
+        last_x, last_value = np.array(value, copy=True), (r, j)
+        return r, j
+
+    # [subsec:verification_outputs; eq:flow_acceptance_tolerance]
+    # Default physical flow-residual threshold:
+    # tau=sqrt(machine epsilon)*max(1,||z||inf), approximately 1.49e-8
+    # when ||z||inf<=1. PAL correctors instead pass their own explicit tolerance.
+    def threshold(value):
+        return (float(tolerance) if tolerance is not None else
+                float(np.sqrt(np.finfo(float).eps)*max(1.0, np.linalg.norm(value, np.inf))))
+
+    try:
+        for iterations in range(1, coupling.max_iter+1):
+            r, j = checked(x)
+            singular = np.linalg.svd(j, compute_uv=False)
+            smallest = float(singular[-1])
+            condition = float(singular[0]/smallest) if smallest > 0.0 else float("inf")
+            if np.linalg.norm(r, np.inf) <= threshold(x):
+                message = "original residual criterion satisfied"
+                break
+            # [eq:newton_system]
+            # Solve J_R*delta_z=-R. For ill-conditioned J_R, np.linalg.lstsq supplies
+            # a truncated least-squares linear step. A failed descent check switches
+            # to a residual-merit gradient direction.
+            if condition < coupling.condition_limit:
+                step = np.linalg.solve(j, -r)
+            else:
+                step = np.linalg.lstsq(j, -r, rcond=1.0/coupling.condition_limit)[0]
+            gradient = j.T @ r
+            descent = float(gradient @ step)
+            if not np.isfinite(descent) or descent >= 0.0:
+                step = -gradient/max(1.0, np.linalg.norm(gradient))
+                descent = float(gradient @ step)
+            if descent >= 0.0:
+                message = "no residual descent direction"
+                break
+            # [eq:newton_update]
+            # Armijo merit phi=||R||_2^2/2; require
+            # phi(z+eta*step)<=phi(z)+armijo*eta*grad(phi).step.
+            # Start eta=1 and halve at each backtrack; trial residuals are nonlinear.
+            merit = 0.5*float(r @ r)
+            damping, accepted = 1.0, False
+            for _ in range(coupling.max_backtracks):
+                trial = x+damping*step
+                try:
+                    rt, _ = checked(trial)
+                    if (0.5*float(rt @ rt) <= merit+coupling.armijo*damping*descent
+                            or np.linalg.norm(rt, np.inf) <= threshold(trial)):
+                        accepted = True
+                        break
+                except (FloatingPointError, OverflowError, RuntimeError):
+                    pass
+                damping *= 0.5
+            if not accepted:
+                message = "line search exhausted"
+                break
+            # [eq:newton_update]
+            # Accept z_next=z+eta*delta_z (or the safeguarded descent step).
+            x = trial
+            if verbose:
+                print(f"[Newton] iteration={iterations:03d}, R={np.linalg.norm(rt, np.inf):.3e}, "
+                      f"step={damping:.3g}, cond(J)={condition:.3e}")
+    except (FloatingPointError, OverflowError, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+        message = f"Newton stopped: {type(exc).__name__}: {exc}"
+
+    # [subsec:coupled_solution]
+    # Trust-region reflective nonlinear least squares uses the same original
+    # residual and analytical Jacobian; a solver success flag alone cannot
+    # replace the independent residual acceptance criterion.
+    if best_norm > threshold(best_x) and coupling.least_squares_fallback:
+        try:
+            lsq = least_squares(
+                lambda v: checked(v)[0], best_x, jac=lambda v: checked(v)[1],
+                method="trf", x_scale="jac", ftol=settings.TRF_FTOL,
+                xtol=settings.TRF_XTOL, gtol=settings.TRF_GTOL,
+                max_nfev=int(coupling.max_iter))
+            checked(lsq.x)
+            method = "reduced_newton+analytical_TRF"
+            message += "; TRF: "+str(lsq.message).replace("\n", " ")
+        except (FloatingPointError, OverflowError, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            message += f"; TRF stopped: {type(exc).__name__}: {exc}"
+    try:
+        r, j = checked(best_x)
+        singular = np.linalg.svd(j, compute_uv=False)
+        smallest = float(singular[-1])
+        condition = float(singular[0]/smallest) if smallest > 0.0 else float("inf")
+    except (FloatingPointError, OverflowError, ValueError, RuntimeError, np.linalg.LinAlgError):
+        pass
+    return _NewtonOutcome(best_x, best_norm, best_norm <= threshold(best_x),
+                          iterations, calls, condition, smallest, method, message)
+
+
+class MultiPassageCoupledSolver:
+    def __init__(self, aero_solver, network, coupling, limits):
+        self.aero_solver, self.network = aero_solver, network
+        self.coupling, self.limits = coupling, limits
+
+    def solve(self, verbose=False, initial_vn=None, initial_q=None, coupling_strength=1.0):
+        """Exact panel condensation followed by damped Newton in channel flows.
+
+        Interfaces/seeds/homotopy match the previous solver. The final candidate
+        is checked by an independent full panel solve and the original hydraulic
+        inversion. Returned channel states use Q_trial, the same flows used to
+        build the returned aerodynamic field, and retain original residuals.
+        """
+        geom, flow = self.aero_solver.geom, self.aero_solver.flow
         if initial_q is not None and initial_vn is not None:
             raise ValueError("Provide initial_q or initial_vn, not both.")
-
+        if not np.isfinite(coupling_strength) or not 0.0 <= coupling_strength <= 1.0:
+            raise ValueError("coupling_strength must lie in [0, 1].")
         try:
             self.network.validate_geometry(geom, self.limits)
         except ValueError as exc:
-            zero_vn = np.zeros(geom.num_pan, dtype=float)
-            aero = self.aero_solver.solve(normal_transpiration=zero_vn)
+            zero = np.zeros(geom.num_pan)
             return MultiPassageResult(
-                aero_result=aero,
-                passage_states=[],
-                normal_transpiration=zero_vn,
-                converged=False,
-                iterations=0,
-                max_vn=float("nan"),
-                max_vn_over_vinf=float("nan"),
-                coupling_status="invalid_geometry",
-                solver_message=str(exc),
-            )
-
-        q_scale = np.asarray(
-            [
-                max(
-                    float(passage.chamber.height) * float(flow.v_inf),
-                    np.finfo(float).tiny,
-                )
-                for passage in self.network.passages
-            ],
-            dtype=float,
-        )
-
-        def states_for_trial_flow(q_trial: np.ndarray) -> list[PassageState]:
-            """Create lightweight states for the conservative Q-to-vn mapping."""
-            return [
-                PassageState(
-                    Q=float(q_value),
-                    p1=0.0,
-                    p2=0.0,
-                    dp_total=0.0,
-                    Rs=0.0,
-                    reynolds_equivalent=0.0,
-                )
-                for q_value in q_trial
-            ]
-
-        # Construct a physically consistent starting state.
+                self.aero_solver.solve(zero), [], zero, False, 0,
+                float("nan"), float("nan"), coupling_status="invalid_geometry",
+                solver_message=str(exc))
+        problem = ReducedFlowProblem(self.aero_solver, self.network, coupling_strength)
+        q_scale = problem.q_scale
         if initial_q is not None:
-            seed_q = np.asarray(initial_q, dtype=float).copy()
-            if seed_q.shape != (n_passages,):
-                raise ValueError(
-                    f"initial_q must have shape ({n_passages},), got {seed_q.shape}."
-                )
-            if not np.all(np.isfinite(seed_q)):
-                raise ValueError("initial_q must contain only finite values.")
-            full_seed_vn = self.network.transpiration_from_flow(
-                geom=geom,
-                states=states_for_trial_flow(seed_q),
-            )
-            starting_vn = coupling_strength * full_seed_vn
-            initial_q_dimensionless = seed_q / q_scale
+            seed = np.asarray(initial_q, dtype=float)
+            if seed.shape != q_scale.shape or not np.all(np.isfinite(seed)):
+                raise ValueError(f"initial_q must be finite with shape {q_scale.shape}.")
+            z0 = seed/q_scale
+        elif initial_vn is not None:
+            vn = np.asarray(initial_vn, dtype=float)
+            if vn.shape != (geom.num_pan,) or not np.all(np.isfinite(vn)):
+                raise ValueError(f"initial_vn must be finite with shape ({geom.num_pan},).")
+            seed_aero = self.aero_solver.solve(vn)
+            states = self.network.solve(geom, self.aero_solver.panel_pressures(seed_aero), flow, seed_aero)
+            z0 = np.array([state.Q for state in states])/q_scale
         else:
-            if initial_vn is None:
-                starting_vn = np.zeros(geom.num_pan, dtype=float)
-            else:
-                starting_vn = np.asarray(initial_vn, dtype=float).copy()
-                if starting_vn.shape != (geom.num_pan,):
-                    raise ValueError(
-                        f"initial_vn must have shape ({geom.num_pan},), "
-                        f"got {starting_vn.shape}."
-                    )
-                if not np.all(np.isfinite(starting_vn)):
-                    raise ValueError("initial_vn must contain only finite values.")
-
-            seed_aero = self.aero_solver.solve(normal_transpiration=starting_vn)
-            seed_pressures = self.aero_solver.panel_pressures(seed_aero)
-            seed_states = self.network.solve(
-                geom=geom,
-                panel_pressures=seed_pressures,
-                aero_result=seed_aero,
-                flow=flow,
-            )
-            seed_q = np.asarray([float(state.Q) for state in seed_states], dtype=float)
-            initial_q_dimensionless = seed_q / q_scale
-
-        last_finite_vn = starting_vn.copy()
-        last_finite_aero = self.aero_solver.solve(normal_transpiration=starting_vn)
-        last_finite_pressures = self.aero_solver.panel_pressures(last_finite_aero)
-        last_finite_states = self.network.solve(
-            geom=geom,
-            panel_pressures=last_finite_pressures,
-            aero_result=last_finite_aero,
-            flow=flow,
-        )
-
-        residual_norm = float("nan")
-        floating_point_resolution = float("nan")
-        solver_success = False
-        solver_message = ""
-        coupling_status = "not_converged"
-        evaluation_count = 0
-        numerical_failure = False
-
-        def coupling_residual(q_trial_dimensionless: np.ndarray) -> np.ndarray:
-            nonlocal evaluation_count
-            nonlocal last_finite_vn
-            nonlocal last_finite_aero
-            nonlocal last_finite_states
-
-            evaluation_count += 1
-            q_trial_dimensionless = np.asarray(q_trial_dimensionless, dtype=float)
-            if (
-                q_trial_dimensionless.shape != (n_passages,)
-                or not np.all(np.isfinite(q_trial_dimensionless))
-            ):
-                raise FloatingPointError("Non-finite passage-flow trial state.")
-
-            q_trial = q_trial_dimensionless * q_scale
-
-            with np.errstate(over="raise", invalid="raise", divide="raise"):
-                vn_full = self.network.transpiration_from_flow(
-                    geom=geom,
-                    states=states_for_trial_flow(q_trial),
-                )
-                vn_trial = coupling_strength * vn_full
-                aero_result = self.aero_solver.solve(normal_transpiration=vn_trial)
-                panel_pressures = self.aero_solver.panel_pressures(aero_result)
-                hydraulic_states = self.network.solve(
-                    geom=geom,
-                    panel_pressures=panel_pressures,
-                    aero_result=aero_result,
-                    flow=flow,
-                )
-
-            q_pressure_driven = np.asarray(
-                [float(state.Q) for state in hydraulic_states],
-                dtype=float,
-            )
-            residual = (q_trial - q_pressure_driven) / q_scale
-
-            if (
-                not np.all(np.isfinite(vn_trial))
-                or not np.all(np.isfinite(panel_pressures))
-                or not np.all(np.isfinite(q_pressure_driven))
-                or not np.all(np.isfinite(residual))
-                or not np.isfinite(aero_result.CL)
-            ):
-                raise FloatingPointError("Non-finite coupled state.")
-
-            last_finite_vn = vn_trial.copy()
-            last_finite_aero = aero_result
-            last_finite_states = hydraulic_states
-
-            if verbose:
-                print(
-                    f"[Coupling] lambda={coupling_strength:.3f} | "
-                    f"evaluation={evaluation_count:03d} | "
-                    f"CL={aero_result.CL: .8f} | "
-                    f"max|Q|={np.max(np.abs(q_trial)): .6e} | "
-                    f"max|scaled residual|={np.max(np.abs(residual)): .3e}"
-                )
-
-            return residual
-
-        # ------------------------------------------------------------------
-        # Robust nonlinear solution hierarchy
-        # ------------------------------------------------------------------
-        best_q_dimensionless = initial_q_dimensionless.copy()
-        best_residual_norm = float("inf")
-        best_residual_tolerance = float("nan")
-        best_method = "initial_guess"
-        attempt_messages: list[str] = []
-        converged = False
-        final_iteration = 0
-        selected_solver_message = ""
-
-        def assess_candidate(
-            q_dimensionless: np.ndarray,
-            method_name: str,
-        ) -> tuple[float, float, bool]:
-            nonlocal best_q_dimensionless
-            nonlocal best_residual_norm
-            nonlocal best_residual_tolerance
-            nonlocal best_method
-
-            q_dimensionless = np.asarray(q_dimensionless, dtype=float)
-            if (
-                q_dimensionless.shape != (n_passages,)
-                or not np.all(np.isfinite(q_dimensionless))
-            ):
-                return float("inf"), float("nan"), False
-
-            residual = coupling_residual(q_dimensionless)
-            norm = float(np.max(np.abs(residual)))
-            state_scale = max(1.0, float(np.max(np.abs(q_dimensionless))))
-            tolerance = float(np.sqrt(np.finfo(float).eps) * state_scale)
-
-            if np.isfinite(norm) and norm < best_residual_norm:
-                best_residual_norm = norm
-                best_residual_tolerance = tolerance
-                best_q_dimensionless = q_dimensionless.copy()
-                best_method = method_name
-
-            return norm, tolerance, bool(norm <= tolerance)
-
-        try:
-            current_guess = initial_q_dimensionless.copy()
-
-            for factor in (0.5, 0.2):
-                try:
-                    hybr_result = root(
-                        coupling_residual,
-                        current_guess,
-                        method="hybr",
-                        options={
-                            "maxfev": int(self.coupling.max_iter),
-                            "factor": float(factor),
-                            "xtol": 1.0e-10,
-                        },
-                    )
-                    q_candidate = np.asarray(hybr_result.x, dtype=float)
-                    norm, tolerance, resolved = assess_candidate(
-                        q_candidate,
-                        method_name=f"hybr(factor={factor:g})",
-                    )
-                    message = str(hybr_result.message).replace("\n", " ")
-                    attempt_messages.append(
-                        f"HYBR factor={factor:g}: success={bool(hybr_result.success)}, "
-                        f"residual={norm:.3e}, message={message}"
-                    )
-                    if np.all(np.isfinite(q_candidate)):
-                        current_guess = q_candidate.copy()
-                    if resolved:
-                        converged = True
-                        residual_norm = norm
-                        floating_point_resolution = tolerance
-                        solver_success = bool(hybr_result.success)
-                        selected_solver_message = message
-                        best_method = f"hybr(factor={factor:g})"
-                        break
-                except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
-                    attempt_messages.append(
-                        f"HYBR factor={factor:g}: {type(exc).__name__}: {exc}"
-                    )
-
-            if not converged:
-                try:
-                    lsq_result = least_squares(
-                        coupling_residual,
-                        x0=current_guess,
-                        method="trf",
-                        jac="3-point",
-                        x_scale="jac",
-                        ftol=1.0e-12,
-                        xtol=1.0e-12,
-                        gtol=1.0e-12,
-                        max_nfev=max(1000, 4 * int(self.coupling.max_iter)),
-                    )
-                    q_candidate = np.asarray(lsq_result.x, dtype=float)
-                    norm, tolerance, resolved = assess_candidate(
-                        q_candidate,
-                        method_name="least_squares(TRF)",
-                    )
-                    message = str(lsq_result.message).replace("\n", " ")
-                    attempt_messages.append(
-                        f"TRF: success={bool(lsq_result.success)}, "
-                        f"residual={norm:.3e}, message={message}"
-                    )
-                    if resolved:
-                        converged = True
-                        residual_norm = norm
-                        floating_point_resolution = tolerance
-                        solver_success = bool(lsq_result.success)
-                        selected_solver_message = message
-                        best_method = "least_squares(TRF)"
-                except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
-                    attempt_messages.append(f"TRF: {type(exc).__name__}: {exc}")
-
-            # Synchronize the returned aerodynamic/hydraulic state with the best
-            # candidate, whether or not it is an accepted root.
-            if np.all(np.isfinite(best_q_dimensionless)):
-                try:
-                    norm, tolerance, _ = assess_candidate(
-                        best_q_dimensionless,
-                        method_name=best_method,
-                    )
-                    if not converged:
-                        residual_norm = norm
-                        floating_point_resolution = tolerance
-                except (FloatingPointError, OverflowError, ValueError, RuntimeError):
-                    pass
-
-            if not converged:
-                solver_success = False
-                selected_solver_message = (
-                    f"No retry reached the residual criterion; best method={best_method}."
-                )
-
-            final_iteration = evaluation_count
-            coupling_status = "converged" if converged else "not_converged"
-            solver_message = (
-                f"lambda={coupling_strength:.3f}; selected={best_method}; "
-                f"{selected_solver_message} "
-                + " | ".join(attempt_messages)
-            ).strip()
-
-            if verbose:
-                print(
-                    f"[Coupling] robust nonlinear solve: "
-                    f"lambda={coupling_strength:.3f}, converged={converged}, "
-                    f"selected={best_method}, evaluations={final_iteration}, "
-                    f"max|scaled residual|={residual_norm:.3e}"
-                )
-                for attempt in attempt_messages:
-                    print(f"[Coupling]   {attempt}")
-
-        except (FloatingPointError, OverflowError, ValueError, RuntimeError) as exc:
-            converged = False
-            numerical_failure = True
-            coupling_status = "numerical_failure"
-            solver_success = False
-            solver_message = (
-                f"lambda={coupling_strength:.3f}; {type(exc).__name__}: {exc}"
-            )
-            residual_norm = (
-                best_residual_norm if np.isfinite(best_residual_norm) else float("nan")
-            )
-            floating_point_resolution = best_residual_tolerance
-            final_iteration = evaluation_count
-            if verbose:
-                print(
-                    f"[Coupling] robust nonlinear solve stopped after "
-                    f"{evaluation_count} evaluations: {type(exc).__name__}: {exc}"
-                )
-
-        max_vn = float(np.max(np.abs(last_finite_vn)))
+            problem.evaluate(np.zeros(problem.size))
+            z0 = problem.q_hydraulic.copy()/q_scale
+        outcome = _damped_newton(problem.residual_and_jacobian, z0, self.coupling, verbose=verbose)
+        # [eq:flow_scaling; subsec:verification_outputs]
+        # Recover q=S*z, then rebuild Vn and solve the full aerodynamic equations.
+        # Final checks below do not use the condensed pressure tensors.
+        q_trial = outcome.x*q_scale
+        vn = coupling_strength*(problem.normal_map @ q_trial)
+        # Independent, original evaluator. No condensed pressure coefficients
+        # participate in this final acceptance check.
+        aero = self.aero_solver.solve(vn)
+        pressures = self.aero_solver.panel_pressures(aero)
+        states = self.network.solve(geom, pressures, flow, aero)
+        q_hyd = np.array([state.Q for state in states])
+        # [eq:coupled_residual; subsec:verification_outputs]
+        # Independent original residual ||S^-1*(q_trial-q_hyd(full panel p))||inf.
+        # Returned states are subsequently set to q_trial so fields and stored flows
+        # refer to the same candidate, not to a separate hydraulic prediction.
+        original_norm = float(np.linalg.norm((q_trial-q_hyd)/q_scale, np.inf))
+        tolerance = float(np.sqrt(np.finfo(float).eps)*max(1.0, np.linalg.norm(outcome.x, np.inf)))
+        energy_norm = 0.0
+        for k, (passage, state) in enumerate(zip(self.network.passages, states)):
+            hydraulic_q = state.Q
+            state.Q = float(q_trial[k])
+            speed = abs(state.Q)/passage.chamber.height
+            friction, re, factor, model = _rectangular_2d_pressure_drop_abs(
+                speed, flow.rho_inf, flow.mu_inf, problem.lengths[k], problem.heights[k])
+            jet = problem.kinetic_factor*0.5*flow.rho_inf*speed**2
+            diagnostics = state.energy_diagnostics
+            available = diagnostics["available_channel_head_Pa"]
+            balance = available-friction-jet
+            energy_norm = max(energy_norm, abs(balance))
+            diagnostics.update({
+                "hydraulic_predicted_q_per_unit_span_m2_s": float(hydraulic_q),
+                "channel_friction_loss_Pa": float(friction),
+                "outlet_jet_kinetic_head_Pa": float(jet),
+                "outlet_jet_speed_m_s": float(speed),
+                "energy_balance_residual_Pa": float(balance),
+                "friction_power_W_per_m_span": float(abs(state.Q)*friction),
+                "inlet_turning_power_W_per_m_span": float(abs(state.Q)*diagnostics["inlet_tangential_head_removed_Pa"]),
+                "outlet_kinetic_energy_flux_W_per_m_span": float(abs(state.Q)*jet),
+            })
+            if diagnostics["energy_balance_active"]:
+                outlet_pressure = state.p2 if diagnostics["inlet_pore"] == 1 else state.p1
+                diagnostics["outlet_jet_total_pressure_Pa"] = float(outlet_pressure+jet)
+            state.reynolds_equivalent, state.friction_factor = re, factor
+            state.resistance_model = model+("+outlet_jet_kinetic_head" if problem.kinetic_factor else "")
+            state.Rs = abs(state.p1-state.p2)/abs(state.Q) if state.Q else float("inf")
+        # The flow residual is authoritative. Also check the equivalent energy
+        # balance, scaled by its local hydraulic slope, and flow direction.
+        # [subsec:verification_outputs; eq:channel_energy_equation;
+        # eq:energy_acceptance_check]
+        # For each channel, e_k=available_head-dp_f(|q_trial|)-jet_head.
+        # Require max_k |e_k|/[g'_k(max(|q_trial|,|q_hyd|))*q_scale_k]<=2*tau,
+        # plus flow mismatch <=tau and direction consistency (with residual-sized
+        # roundoff allowance). No separate hard Re_h=2300 branch check is present.
+        energy_flow_norm = max((
+            abs(s.energy_diagnostics["energy_balance_residual_Pa"])
+            /max(_channel_head_slope(max(abs(s.Q), abs(q_hyd[k])), flow,
+                                     problem.lengths[k], problem.heights[k], problem.kinetic_factor)
+                 *q_scale[k], np.finfo(float).tiny)
+            for k, s in enumerate(states)), default=0.0)
+        direction_ok = all(q == 0.0 or np.sign(q) == np.sign(s.p1-s.p2)
+                           for q, s in zip(q_trial, states))
+        # At pressure ties the original closure requires zero flow; roundoff
+        # deviations below the flow-residual tolerance are allowed as before.
+        direction_ok = direction_ok or bool(np.max(np.abs(q_trial-q_hyd)/q_scale) <= tolerance)
+        accepted = bool(outcome.converged and original_norm <= tolerance
+                        and energy_flow_norm <= 2.0*tolerance and direction_ok)
+        max_vn = float(np.max(np.abs(vn)))
         return MultiPassageResult(
-            aero_result=last_finite_aero,
-            passage_states=last_finite_states,
-            normal_transpiration=last_finite_vn,
-            converged=bool(converged and not numerical_failure),
-            iterations=final_iteration,
-            max_vn=max_vn,
-            max_vn_over_vinf=max_vn / max(flow.v_inf, 1e-16),
-            coupling_status=coupling_status,
-            residual_norm=residual_norm,
-            residual_tolerance=floating_point_resolution,
-            solver_success=solver_success,
-            solver_message=solver_message,
-            function_evaluations=evaluation_count,
-        )
+            aero, states, vn, accepted, outcome.iterations, max_vn, max_vn/flow.v_inf,
+            coupling_status="converged" if accepted else "not_converged",
+            residual_norm=original_norm, residual_tolerance=tolerance,
+            solver_success=accepted,
+            solver_message=(f"lambda={coupling_strength:.3f}; selected={outcome.method}; "
+                            f"{outcome.message}; original_R={original_norm:.3e}; "
+                            f"energy_R_Pa={energy_norm:.3e}; cond(J)={outcome.condition_number:.3e}"),
+            function_evaluations=problem.evaluation_count,
+            newton_iterations=outcome.iterations,
+            jacobian_condition_number=outcome.condition_number,
+            jacobian_smallest_singular_value=outcome.smallest_singular_value,
+            reduced_residual_norm=outcome.residual_norm,
+            original_energy_residual_max_pa=energy_norm)
 
 
 # =============================================================================
@@ -1405,8 +1550,8 @@ def build_model1_chordwise(
     """Build four horizontal in-plane rectangular channels."""
     horizontal_channels = model1_horizontal_surface_pores(
         geom=geom,
-        n_channels=4,
-        max_y_fraction=0.85,
+        n_channels=settings.MODEL1_CHANNEL_COUNT,
+        max_y_fraction=settings.MODEL1_MAX_Y_FRACTION,
     )
     passages: list[PassageSpec] = []
     for i, (x1, side1, x2, side2, y_level) in enumerate(horizontal_channels, start=1):
@@ -1523,7 +1668,11 @@ def build_model_specs(
     # intersect the rear opening of the inner horizontal channel in Model 3.
     # Ending the equally spaced set at x/c=0.890 provides finite clearance at
     # H=10 mm while preserving the four-channel lower-to-upper layout.
-    vertical_x_values = np.linspace(0.100, 0.890, 4)
+    # [subsec:model_overview]
+    # Current vertical positions are x/c=(0.100,0.363333...,0.626667...,0.890).
+    # The combined model copies the horizontal and vertical channels without
+    # adding junctions at their crossings.
+    vertical_x_values = tuple(settings.MODEL2_X_LOCATIONS)
 
     model_2 = build_vertical_passages(vertical_x_values, height, "m2")
     model_3h = _copy_passages_with_prefix(model_1, "m3c", "LE_to_TE_internal_channel")
@@ -1537,19 +1686,19 @@ def build_model_specs(
     return [
         PorousModelSpec(
             name="model_1_4_chordwise",
-            description="4 straight horizontal rectangular channels; " + size_text + ".",
+            description=f"{len(model_1)} straight horizontal rectangular channels; " + size_text + ".",
             passages=tuple(model_1),
         ),
         PorousModelSpec(
             name="model_2_9_perpendicular",
-            description="4 independent lower-to-upper rectangular channels; " + size_text + ".",
+            description=f"{len(model_2)} independent lower-to-upper rectangular channels; " + size_text + ".",
             passages=tuple(model_2),
         ),
         PorousModelSpec(
             name="model_3_combined_independent",
             description=(
                 "Combined horizontal and vertical rectangular channels. "
-                "All 8 passages are independent; internal intersections are not connected; "
+                f"All {len(model_3h)+len(model_3v)} passages are independent; internal intersections are not connected; "
                 + size_text + "."
             ),
             passages=tuple(model_3h + model_3v),
@@ -1597,7 +1746,8 @@ def build_base_problem(
     )
 
     geom = PanelGeometry(xb, yb, aoa_deg)
-    ref = ReferenceConfig(x_ref=0.25 * chord, y_ref=0.0)
+    ref = ReferenceConfig(x_ref=settings.MOMENT_REFERENCE_X_C*chord,
+                          y_ref=settings.MOMENT_REFERENCE_Y_C*chord)
     aero_solver = SourceVortexPanelMethod(geom, flow, ref)
 
     return flow, geom, ref, aero_solver
@@ -1840,6 +1990,11 @@ def coupling_diagnostics(result: MultiPassageResult) -> dict:
         "coupling_solver_success": result.solver_success,
         "coupling_solver_message": result.solver_message,
         "coupling_function_evaluations": result.function_evaluations,
+        "coupling_newton_iterations": result.newton_iterations,
+        "coupling_jacobian_condition_number": result.jacobian_condition_number,
+        "coupling_jacobian_smallest_singular_value": result.jacobian_smallest_singular_value,
+        "coupling_reduced_residual_max": result.reduced_residual_norm,
+        "coupling_original_energy_residual_max_Pa": result.original_energy_residual_max_pa,
     }
 
 
@@ -1892,6 +2047,7 @@ def make_nonconverged_summary_row(
         "coupling_iterations": porous_result.iterations,
         **coupling_diagnostics(porous_result),
         "elapsed_seconds": elapsed_seconds,
+        **aerodynamic_change_metrics(solid_result, None, False),
     }
 
 
@@ -1969,7 +2125,7 @@ def build_model_summary_row(
         "delta_CL": aero.CL - solid_result.CL,
         "delta_CD": aero.CD - solid_result.CD,
         "delta_CM": aero.CM - solid_result.CM,
-        "gain_percent_vs_solid_panel": 100.0 * (aero.CL / solid_result.CL - 1.0),
+        "gain_percent_vs_solid_panel": aerodynamic_change_metrics(solid_result, aero)["gain_percent_vs_solid_panel"],
         "max_abs_q_per_unit_span_m2_s": max(q_abs) if q_abs else 0.0,
         "sum_abs_q_per_unit_span_m2_s": sum(q_abs),
         "max_dp_total_Pa": max(dp_values) if dp_values else 0.0,
@@ -1980,6 +2136,7 @@ def build_model_summary_row(
         "coupling_iterations": porous_result.iterations,
         **coupling_diagnostics(porous_result),
         "elapsed_seconds": elapsed_seconds,
+        **aerodynamic_change_metrics(solid_result, aero, True),
     }
 
 
@@ -2136,6 +2293,10 @@ def _solve_with_coupling_homotopy(
         original_full_result.solver_message += " | homotopy failed at lambda=0"
         return original_full_result
 
+    # [subsec:coupled_solution -- coupling homotopy]
+    # Continue chi from 0 to 1 in Vn=chi*M*q. chi=0 retains pressure-driven
+    # hydraulic predictions but removes their aerodynamic feedback.
+    # Only the chi=1 endpoint is a physical full-coupling sweep result.
     low_lam = 0.0
     low_q = _result_flow_vector(stage0)
     high_lam: float | None = None
@@ -2471,41 +2632,12 @@ def _evaluate_coupled_residual_at_q_alpha(
     lambda=1.  It is exposed here only so pseudo-arclength continuation can
     treat alpha as an additional unknown.
     """
-    flow_i, geom_i, aero_solver_i, _, network_i = _build_coupled_case_context(
-        model=model,
-        airfoil_name=airfoil_name,
-        chord=chord,
-        n_panels=n_panels,
-        alpha_deg=float(alpha_deg),
-        reynolds_external=float(reynolds_external),
-        rho_inf=rho_inf,
-        mu_inf=mu_inf,
-        p_inf=p_inf,
+    context = _build_coupled_case_context(
+        model, airfoil_name, chord, n_panels, float(alpha_deg),
+        reynolds_external, rho_inf, mu_inf, p_inf,
     )
-    q_scale = _q_scale_for_context(network_i, flow_i)
-    q_dimensionless = np.asarray(q_dimensionless, dtype=float)
-    if q_dimensionless.shape != q_scale.shape or not np.all(np.isfinite(q_dimensionless)):
-        raise FloatingPointError("Invalid pseudo-arclength Q state.")
-
-    q_physical = q_dimensionless * q_scale
-    vn = network_i.transpiration_from_flow(
-        geom=geom_i,
-        states=_states_for_fixed_q(q_physical),
-    )
-    aero = aero_solver_i.solve(normal_transpiration=vn)
-    pressures = aero_solver_i.panel_pressures(aero)
-    hydraulic_states = network_i.solve(
-        geom=geom_i,
-        panel_pressures=pressures,
-        aero_result=aero,
-        flow=flow_i,
-    )
-    q_pressure = np.asarray([float(state.Q) for state in hydraulic_states], dtype=float)
-    residual = (q_physical - q_pressure) / q_scale
-
-    if not np.all(np.isfinite(residual)):
-        raise FloatingPointError("Non-finite pseudo-arclength residual.")
-    return residual
+    problem = ReducedFlowProblem(context[2], context[4])
+    return problem.evaluate(q_dimensionless, alpha_deg)[0]
 
 
 def _pseudo_arclength_to_target(
@@ -2548,6 +2680,7 @@ def _pseudo_arclength_to_target(
         model, airfoil_name, chord, n_panels, alpha1, reynolds_external,
         rho_inf, mu_inf, p_inf,
     )
+    branch_problem = ReducedFlowProblem(base_context[2], base_context[4])
     q_scale = _q_scale_for_context(base_context[4], base_context[0])
     if q0.shape != q_scale.shape or q1.shape != q_scale.shape:
         metadata = {"attempted": False, "reason": "seed_shape_mismatch"}
@@ -2585,70 +2718,28 @@ def _pseudo_arclength_to_target(
     for step_id in range(1, PAL_MAX_STEPS + 1):
         z_predictor = z_curr + ds * tangent
 
-        def augmented_residual(z: np.ndarray) -> np.ndarray:
+        # [subsec:coupled_solution -- pseudo-arclength continuation]
+        # Augment R(z_flow,alpha)=0 with t.(z_aug-z_predictor)=0.
+        # z_aug=[z_flow,alpha_deg/PAL_ALPHA_SCALE_DEG]. Its last Jacobian column
+        # converts dR/dalpha_radian using deg2rad(PAL_ALPHA_SCALE_DEG).
+        def augmented_evaluation(z):
             z = np.asarray(z, dtype=float)
-            q_dim = z[:-1]
-            alpha_trial = float(z[-1] * PAL_ALPHA_SCALE_DEG)
+            alpha_trial = float(z[-1]*PAL_ALPHA_SCALE_DEG)
             if not np.isfinite(alpha_trial) or abs(alpha_trial) > PAL_ALPHA_LIMIT_DEG:
-                return np.full(z.shape, 1.0e3, dtype=float)
-            physical_residual = _evaluate_coupled_residual_at_q_alpha(
-                model=model,
-                airfoil_name=airfoil_name,
-                chord=chord,
-                n_panels=n_panels,
-                alpha_deg=alpha_trial,
-                reynolds_external=reynolds_external,
-                rho_inf=rho_inf,
-                mu_inf=mu_inf,
-                p_inf=p_inf,
-                q_dimensionless=q_dim,
-            )
-            arc_residual = float(np.dot(z - z_predictor, tangent))
-            return np.concatenate((physical_residual, [arc_residual]))
+                raise FloatingPointError("Pseudo-arclength angle exceeded its allowed range.")
+            residual, jacobian, alpha_derivative = branch_problem.evaluate(z[:-1], alpha_trial)
+            augmented = np.r_[residual, np.dot(z-z_predictor, tangent)]
+            matrix = np.empty((z.size, z.size))
+            matrix[:-1, :-1] = jacobian
+            matrix[:-1, -1] = alpha_derivative*np.deg2rad(PAL_ALPHA_SCALE_DEG)
+            matrix[-1] = tangent
+            return augmented, matrix
 
-        best_z = None
-        best_norm = float("inf")
-        method = "none"
-
-        try:
-            rr = root(
-                augmented_residual,
-                z_predictor,
-                method="hybr",
-                options={
-                    "maxfev": max(500, int(coupling.max_iter)),
-                    "factor": 0.5,
-                    "xtol": 1.0e-10,
-                },
-            )
-            zr = np.asarray(rr.x, dtype=float)
-            if np.all(np.isfinite(zr)):
-                nr = float(np.max(np.abs(augmented_residual(zr))))
-                if nr < best_norm:
-                    best_z, best_norm, method = zr.copy(), nr, "PAL-HYBR"
-        except (FloatingPointError, OverflowError, ValueError, RuntimeError):
-            pass
-
-        if best_norm > PAL_CORRECTOR_TOL:
-            try:
-                lr = least_squares(
-                    augmented_residual,
-                    x0=z_predictor if best_z is None else best_z,
-                    method="trf",
-                    jac="3-point",
-                    x_scale="jac",
-                    ftol=1.0e-12,
-                    xtol=1.0e-12,
-                    gtol=1.0e-12,
-                    max_nfev=max(1500, 5 * int(coupling.max_iter)),
-                )
-                zl = np.asarray(lr.x, dtype=float)
-                if np.all(np.isfinite(zl)):
-                    nl = float(np.max(np.abs(augmented_residual(zl))))
-                    if nl < best_norm:
-                        best_z, best_norm, method = zl.copy(), nl, "PAL-TRF"
-            except (FloatingPointError, OverflowError, ValueError, RuntimeError):
-                pass
+        corrector = _damped_newton(
+            augmented_evaluation, z_predictor, coupling, tolerance=PAL_CORRECTOR_TOL)
+        best_z = corrector.x if np.isfinite(corrector.residual_norm) else None
+        best_norm = corrector.residual_norm
+        method = "PAL-"+corrector.method
 
         if best_z is None or best_norm > PAL_CORRECTOR_TOL:
             stages.append(f"s={step_id}:corrector_fail(R={best_norm:.3e},ds={ds:.4g})")
@@ -2760,6 +2851,7 @@ def _pseudo_arclength_to_target(
 # =============================================================================
 # AOA SWEEP
 # =============================================================================
+@timed_stage("model_height_sweep")
 def run_porous_aoa_sweep_for_model(
     model: PorousModelSpec,
     airfoil_name: str,
@@ -2808,6 +2900,10 @@ def run_porous_aoa_sweep_for_model(
         paraview_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"[ParaView] AoA sweep export folder: {paraview_output_dir}")
 
+    # [subsec:coupled_solution; subsec:verification_outputs]
+    # Sweep order starts nearest zero, then follows separate positive/negative
+    # branches. Failed target solves may use AoA, Re_c, homotopy, then PAL
+    # continuation; only verified requested operating points are reported.
     # Solve the requested point nearest alpha=0 first, then march independently
     # toward positive and negative AoA.  This avoids carrying a high-load branch
     # through zero from the negative end of the original sweep ordering.
@@ -2832,6 +2928,7 @@ def run_porous_aoa_sweep_for_model(
     }
 
     for branch, alpha in solve_order:
+        case_started = time.perf_counter()
         if branch == "anchor":
             previous_alpha = None
             initial_q = None
@@ -3065,6 +3162,10 @@ def run_porous_aoa_sweep_for_model(
             "pseudo_arclength_steps": int(pal_meta.get("steps", 0)),
             "pseudo_arclength_reached_target": bool(pal_meta.get("reached_target", False)),
         })
+        row.update(aerodynamic_change_metrics(solid_i, coupled_i.aero_result, coupled_i.converged))
+        row["elapsed_seconds"] = time.perf_counter()-case_started
+        if settings.PRINT_METRICS_PER_CASE:
+            print_case_metrics(row, f"{model.name}, alpha={alpha:g} deg")
         row.update(coupling_diagnostics(coupled_i))
         rows_by_alpha[alpha] = row
 
@@ -3099,6 +3200,7 @@ def run_porous_aoa_sweep_for_model(
 # =============================================================================
 # RUN ONE MODEL
 # =============================================================================
+@timed_stage("fixed_case")
 def run_one_model(
     model: PorousModelSpec,
     geom: PanelGeometry,
@@ -3117,6 +3219,16 @@ def run_one_model(
     output_name: str | None = None,
     aoa_sweep_diameters: tuple[float, ...] | None = None,
 ) -> dict:
+    case_started = time.perf_counter()
+    make_contours = bool(make_contours and settings.ENABLE_PLOTS and settings.RUN_CONTOURS)
+    run_aoa_sweep = bool(run_aoa_sweep and settings.RUN_AOA_SWEEP)
+
+    def finish_case(row):
+        row["solve_elapsed_seconds"] = row.get("elapsed_seconds", float("nan"))
+        row["elapsed_seconds"] = time.perf_counter()-case_started
+        pd.DataFrame([row]).to_csv(model_dir / "model_summary.csv", index=False)
+        return row
+
     model_dir = output_root / (output_name or model.name)
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3136,7 +3248,7 @@ def run_one_model(
         network=network,
         coupling=COUPLING,
         limits=GeometryLimits(),
-    ).solve(verbose=True)
+    ).solve(verbose=settings.COUPLING_VERBOSE)
 
     elapsed = time.perf_counter() - t0
 
@@ -3149,7 +3261,7 @@ def run_one_model(
         print(f"[Result] porous CL              : {coupled.aero_result.CL:.8f}")
         print(
             f"[Result] lift gain vs solid [%] : "
-            f"{100.0 * (coupled.aero_result.CL / solid_result.CL - 1.0):.6f}"
+            f"{aerodynamic_change_metrics(solid_result, coupled.aero_result)['gain_percent_vs_solid_panel']:.6f}"
         )
         print(f"[Result] max |vn| / Vinf        : {coupled.max_vn_over_vinf:.8f}")
     else:
@@ -3171,7 +3283,7 @@ def run_one_model(
         pd.DataFrame([summary_row]).to_csv(summary_path, index=False)
         print(f"[CSV Saved] {summary_path}")
         print("[Result] Non-converged case: only NaN summary values were reported.")
-        return summary_row
+        return finish_case(summary_row)
 
     passage_df = build_passage_dataframe(
         model=model,
@@ -3180,15 +3292,17 @@ def run_one_model(
         result=coupled,
     )
     passage_path = model_dir / "passage_summary.csv"
-    passage_df.to_csv(passage_path, index=False)
-    print(f"[CSV Saved] {passage_path}")
+    if settings.EXPORT_PASSAGE_DATA:
+        passage_df.to_csv(passage_path, index=False)
+        print(f"[CSV Saved] {passage_path}")
 
-    export_surface_data(
-        output_dir=model_dir,
-        geom=geom,
-        solid_result=solid_result,
-        porous_result=coupled,
-    )
+    if settings.EXPORT_SURFACE_DATA:
+        export_surface_data(
+            output_dir=model_dir,
+            geom=geom,
+            solid_result=solid_result,
+            porous_result=coupled,
+        )
     if export_paraview:
         export_paraview_files(
             output_dir=model_dir,
@@ -3197,8 +3311,8 @@ def run_one_model(
             aero_solver=aero_solver,
             solid_result=solid_result,
             porous_result=coupled,
-            field_nx=contour_nx,
-            field_ny=contour_ny,
+            field_nx=int(settings.PARAVIEW_FIELD_NX),
+            field_ny=int(settings.PARAVIEW_FIELD_NY),
         )
     else:
         print("[ParaView] Fixed-AoA ParaView export disabled for this model.")
@@ -3210,6 +3324,8 @@ def run_one_model(
         porous_result=coupled,
         elapsed_seconds=elapsed,
     )
+    if settings.PRINT_METRICS_PER_CASE:
+        print_case_metrics(summary_row, model.name)
     summary_path = model_dir / "model_summary.csv"
     pd.DataFrame([summary_row]).to_csv(summary_path, index=False)
     print(f"[CSV Saved] {summary_path}")
@@ -3222,21 +3338,23 @@ def run_one_model(
         output_dir=xfoil_model_dir,
     )
 
-    plot_airfoil_with_porous_network(
-        geom=geom,
-        network=network,
-        coupled_result=coupled,
-        output_dir=model_dir,
-        title=f"{model.name}: Airfoil with Porous Network",
-    )
+    if settings.ENABLE_PLOTS and settings.MAKE_NETWORK_PLOTS and settings.RUN_GEOMETRY:
+        plot_airfoil_with_porous_network(
+            geom=geom,
+            network=network,
+            coupled_result=coupled,
+            output_dir=model_dir,
+            title=f"{model.name}: Airfoil with Porous Network",
+        )
 
-    plot_cp_distribution_with_xfoil(
-        geom=geom,
-        porous_result=coupled.aero_result,
-        solid_result=solid_result,
-        output_dir=model_dir,
-        xfoil_cp_data=xfoil_cp_data,
-    )
+    if settings.ENABLE_PLOTS and settings.MAKE_CP_PLOTS and settings.RUN_AERODYNAMIC_PLOTS:
+        plot_cp_distribution_with_xfoil(
+            geom=geom,
+            porous_result=coupled.aero_result,
+            solid_result=solid_result,
+            output_dir=model_dir,
+            xfoil_cp_data=xfoil_cp_data,
+        )
 
     if make_contours:
         plot_velocity_contours_comparison(
@@ -3288,10 +3406,10 @@ def run_one_model(
                 view_label="zoomed",
             )
     else:
-        print("[Plot] Skipping contour plots because --no-contours was used.")
+        print("[Plot] Contour plots disabled by the function argument or config.py.")
 
     if not run_aoa_sweep:
-        return summary_row
+        return finish_case(summary_row)
 
     print(
         "[Sweep] Running porous + solid panel AoA sweep "
@@ -3378,8 +3496,8 @@ def run_one_model(
                 alpha_step=AOA_SWEEP_STEP_DEG,
                 export_paraview=export_paraview_for_this_diameter,
                 paraview_output_dir=model_dir / "aoa_sweep_paraview",
-                field_nx=contour_nx,
-                field_ny=contour_ny,
+                field_nx=int(settings.PARAVIEW_FIELD_NX),
+                field_ny=int(settings.PARAVIEW_FIELD_NY),
             )
         )
 
@@ -3406,9 +3524,7 @@ def run_one_model(
     sweep_df.to_csv(sweep_csv_path, index=False)
     print(f"[CSV Saved] {sweep_csv_path}")
 
-    plot_aoa_sweep_comparison(
-        sweep_df=sweep_df,
-        output_dir=model_dir,
-    )
+    if settings.ENABLE_PLOTS and settings.RUN_AERODYNAMIC_PLOTS and settings.MAKE_AOA_SWEEP_PLOTS:
+        plot_aoa_sweep_comparison(sweep_df=sweep_df, output_dir=model_dir)
 
-    return summary_row
+    return finish_case(summary_row)

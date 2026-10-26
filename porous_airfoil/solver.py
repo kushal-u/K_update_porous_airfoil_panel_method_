@@ -1,3 +1,13 @@
+# PAPER CROSS-REFERENCES -- coupled aero-hydraulic methodology
+# References use LaTeX labels so they survive equation/section renumbering.
+# [subsec:external_panel] geometry, I/J/K/L, A, b, lambda/gamma, Vt and Cp.
+# [subsec:coupled_solution] cached LU and exact unit-flow responses X_q/T_q.
+# [subsec:verification_outputs] pressure forces, lift/drag and clockwise moment.
+# Notation: geom.S is panel length S_i; ReducedFlowProblem.q_scale in porous.py
+# represents the diagonal entries of the PAPER flow-scaling matrix S.
+# This edition adds comments only; executable statements and docstrings match
+# the uploaded solver. See methods_review.md for manuscript/code differences.
+
 """
 solver.py
 
@@ -13,6 +23,8 @@ This file provides:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
+import hashlib
 
 import numpy as np
 import scipy.linalg as la
@@ -186,13 +198,27 @@ class ReferenceConfig:
 
 @dataclass
 class CouplingConfig:
-    """Nonlinear aero-hydraulic coupling settings.
+    """Reduced Newton controls; acceptance checks the original equations.
 
-    ``max_iter`` limits nonlinear residual evaluations. The coupled solver
-    does not use under-relaxation or user-defined convergence tolerances.
+    max_iter limits Newton iterations (and the fallback's residual calls).
+    Damping is selected by an Armijo line search, not fixed relaxation.
     """
 
     max_iter: int = 10000
+    max_backtracks: int = 24
+    armijo: float = 1.0e-4
+    condition_limit: float = 1.0e12
+    least_squares_fallback: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_iter, int) or self.max_iter < 1:
+            raise ValueError("max_iter must be a positive integer.")
+        if not isinstance(self.max_backtracks, int) or self.max_backtracks < 1:
+            raise ValueError("max_backtracks must be a positive integer.")
+        if not np.isfinite(self.armijo) or not 0.0 < self.armijo < 0.5:
+            raise ValueError("armijo must lie in (0, 0.5).")
+        if not np.isfinite(self.condition_limit) or self.condition_limit <= 1.0:
+            raise ValueError("condition_limit must be finite and > 1.")
 
 
 # =============================================================================
@@ -322,6 +348,10 @@ class SurfacePoint:
     panel_id: int
 
 
+# [subsec:external_panel; eq:normal_boundary]
+# Clockwise boundary; midpoint collocation. t=(cos(phi),sin(phi)),
+# n=(-sin(phi),cos(phi)); delta=phi+pi/2, beta=delta-alpha.
+# Thus V_inf.n=V_inf*cos(beta), V_inf.t=V_inf*sin(beta).
 class PanelGeometry:
     """Store airfoil panel geometry and derived quantities."""
 
@@ -499,6 +529,14 @@ class PanelGeometry:
 # =============================================================================
 # PANEL METHOD
 # =============================================================================
+# [subsec:external_panel; eq:normal_panel_equation;
+# eq:tangential_panel_velocity]
+# Analytical straight-panel integrals: I/J are source normal/tangent
+# influences; K/L are vortex normal/tangent influences with the signs used
+# below. Zero diagonals leave self-influences to the explicit pi and 1/2
+# terms in the system matrix and tangential reconstruction.
+# The local variables A/B/E here are integral auxiliaries, not the PAPER
+# aerodynamic matrix A or channel forcing matrix B.
 def compute_IJKL_vectorized(geom: PanelGeometry) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute source and vortex influence matrices."""
     N = geom.num_pan
@@ -585,26 +623,115 @@ class SPVPResult:
 
 
 class SourceVortexPanelMethod:
-    """Constant-source + constant-vortex panel solver."""
+    """Constant-source + constant-vortex panel solver.
+
+    The bounded mesh cache shares geometry-only matrices and LU factors across
+    AoA/Re cases. No matrix inverse is formed. Geometry arrays must not be
+    mutated after constructing a solver.
+    """
+
+    _mesh_cache: OrderedDict = OrderedDict()
+    _mesh_cache_size = 2
+    _response_cache: OrderedDict = OrderedDict()
+    _response_cache_size = 16
 
     def __init__(self, geom: PanelGeometry, flow: FlowConfig, ref: ReferenceConfig):
         self.geom = geom
         self.flow = flow
         self.ref = ref
 
-        self.I, self.J, self.K, self.L = compute_IJKL_vectorized(geom)
-        self.A = self._build_system_matrix()
-        self.lu_A, self.piv_A = la.lu_factor(self.A)
+        digest = hashlib.sha256()
+        for coordinates in (geom.XB, geom.YB):
+            digest.update(np.ascontiguousarray(coordinates, dtype=np.float64).tobytes())
+        key = (geom.num_pan, digest.digest())
+        self._mesh_key = key
+        cache = type(self)._mesh_cache
+        if key not in cache:
+            self.I, self.J, self.K, self.L = compute_IJKL_vectorized(geom)
+            self.A = self._build_system_matrix()
+            self.lu_A, self.piv_A = la.lu_factor(self.A)
+            arrays = (self.I, self.J, self.K, self.L, self.A, self.lu_A, self.piv_A)
+            for array in arrays:
+                array.setflags(write=False)
+            cache[key] = arrays
+            while len(cache) > type(self)._mesh_cache_size:
+                cache.popitem(last=False)
+        else:
+            (self.I, self.J, self.K, self.L, self.A,
+             self.lu_A, self.piv_A) = cache[key]
+        cache.move_to_end(key)
+
+    def linear_flow_response(self, normal_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return x_Q=A^{-1}B and P=dVt/dQ for Vn=normal_map @ Q.
+
+        Columns are solved together with the cached LU factors. These are exact
+        responses of the discretised linear panel equations, including Kutta.
+        """
+        normal_map = np.asarray(normal_map, dtype=float)
+        if (normal_map.ndim != 2 or normal_map.shape[0] != self.geom.num_pan
+                or not np.all(np.isfinite(normal_map))):
+            raise ValueError("normal_map must be a finite (N, M) array.")
+        response_key = (self._mesh_key, normal_map.shape[1],
+                        hashlib.sha256(np.ascontiguousarray(normal_map).tobytes()).digest())
+        cache = type(self)._response_cache
+        if response_key in cache:
+            cache.move_to_end(response_key)
+            return cache[response_key]
+        # [eq:normal_velocity_map; eq:flow_forcing_matrix;
+        # eq:precomputed_aerodynamic_responses]
+        # normal_map = M [1/m]; rhs = B = [2*pi*M; zero Kutta row].
+        # strengths = X_q solves A X_q = B using cached LU, without forming A^-1.
+        # tangent = T_q = C X_q [eq:reduced_tangential_velocity].
+        rhs = np.zeros((self.geom.num_pan + 1, normal_map.shape[1]))
+        rhs[:-1] = 2.0*np.pi*normal_map
+        strengths = la.lu_solve((self.lu_A, self.piv_A), rhs)
+        vortex_tangent = 0.5 - np.sum(self.L, axis=1)/(2.0*np.pi)
+        tangent = (self.J @ strengths[:-1])/(2.0*np.pi)
+        tangent += vortex_tangent[:, None]*strengths[-1]
+        strengths.setflags(write=False)
+        tangent.setflags(write=False)
+        cache[response_key] = (strengths, tangent)
+        while len(cache) > type(self)._response_cache_size:
+            cache.popitem(last=False)
+        return strengths, tangent
+
+    def freestream_response(self) -> tuple[np.ndarray, np.ndarray]:
+        """Strengths/Vt for cos(alpha), sin(alpha) at the current V_inf.
+
+        Allows continuation in alpha without rebuilding/factorising any matrix.
+        """
+        # [eq:precomputed_aerodynamic_responses; eq:strength_reconstruction]
+        # Two freestream basis columns give x_0(alpha)=X_inf@[cos(alpha),sin(alpha)].
+        # The same basis yields Vt_0(alpha), including freestream tangent velocity.
+        # This trigonometric representation is exact and supports alpha continuation.
+        delta = self.geom.delta
+        v = self.flow.v_inf
+        rhs = np.empty((self.geom.num_pan+1, 2))
+        rhs[:-1, 0] = -2.0*np.pi*v*np.cos(delta)
+        rhs[:-1, 1] = -2.0*np.pi*v*np.sin(delta)
+        rhs[-1, 0] = -2.0*np.pi*v*(np.sin(delta[0])+np.sin(delta[-1]))
+        rhs[-1, 1] = 2.0*np.pi*v*(np.cos(delta[0])+np.cos(delta[-1]))
+        strengths = la.lu_solve((self.lu_A, self.piv_A), rhs)
+        tangent = v*np.column_stack((np.sin(delta), -np.cos(delta)))
+        tangent += (self.J @ strengths[:-1])/(2.0*np.pi)
+        tangent += (0.5-np.sum(self.L, axis=1)/(2.0*np.pi))[:, None]*strengths[-1]
+        return strengths, tangent
 
     def _build_system_matrix(self) -> np.ndarray:
         """Assemble the aerodynamic system matrix."""
         N = self.geom.num_pan
         A = np.zeros((N + 1, N + 1))
 
+        # [eq:normal_panel_equation; eq:aero_matrix]
+        # Normal rows are multiplied by 2*pi: diagonal pi, off-diagonal I_ij,
+        # shared-vortex column -sum_j K_ij. This is why B contains 2*pi*M.
         A[:N, :N] = self.I
         np.fill_diagonal(A[:N, :N], np.pi)
         A[:N, N] = -np.sum(self.K, axis=1)
 
+        # [eq:kutta_condition]
+        # Python panels 0 and N-1 are paper panels 1 and N.
+        # Enforce Vt[0]+Vt[N-1]=0; two gamma/2 self terms give 2*pi here.
         A[N, :N] = self.J[0, :] + self.J[N - 1, :]
         A[N, N] = -np.sum(self.L[0, :] + self.L[N - 1, :]) + 2.0 * np.pi
         return A
@@ -619,6 +746,10 @@ class SourceVortexPanelMethod:
             raise ValueError(f"normal_transpiration must have shape ({N},).")
 
         b = np.zeros(N + 1)
+        # [eq:normal_boundary; eq:normal_panel_equation; eq:aero_matrix]
+        # b = b_inf + B q; normal rows: 2*pi*(Vn - V_inf*cos(beta)).
+        # Kutta RHS contains freestream only; prescribed transpiration enters
+        # the Kutta condition indirectly through the solved strengths.
         b[:N] = -2.0 * np.pi * Vinf * self.geom.cos_beta + 2.0 * np.pi * vn
         b[N] = -2.0 * np.pi * Vinf * (self.geom.sin_beta[0] + self.geom.sin_beta[-1])
         return b
@@ -657,47 +788,64 @@ class SourceVortexPanelMethod:
                 )
 
         b = self._build_rhs(normal_transpiration=vn)
+        # [eq:aero_unknowns; eq:aero_matrix]
+        # x=[lambda_1,...,lambda_N,gamma]^T. This full solve is also used for
+        # the independent final check in MultiPassageCoupledSolver.solve.
         x = la.lu_solve((self.lu_A, self.piv_A), b)
+
+        return self._result_from_strengths(x, vn)
+
+    def _result_from_strengths(self, x: np.ndarray, vn: np.ndarray) -> SPVPResult:
+        """Reconstruct full fields/forces; also used for response verification."""
+        N = self.geom.num_pan
+        Vinf = self.flow.v_inf
+        c = self.geom.chord
+        b = self._build_rhs(normal_transpiration=vn)
 
         lam = x[:-1]
         gamma = x[-1]
 
-        Vt = np.zeros(N, dtype=float)
-        Cp = np.zeros(N, dtype=float)
+        # [eq:tangential_panel_velocity]
+        # Vt_i = V_inf*sin(beta_i) + sum_j J_ij*lambda_j/(2*pi)
+        #        + gamma/2 - gamma*sum_j L_ij/(2*pi).
+        Vt = (Vinf*self.geom.sin_beta + (self.J @ lam)/(2.0*np.pi)
+              + gamma*(0.5 - np.sum(self.L, axis=1)/(2.0*np.pi)))
+        # [eq:pressure_coefficient]
+        # Cp includes BOTH velocity components. vn is the panel-average prescribed
+        # normal velocity, including on panels only partly covered by an opening.
+        Cp = 1.0 - (Vt**2 + vn**2)/Vinf**2
 
-        for i in range(N):
-            Vt[i] = (
-                Vinf * self.geom.sin_beta[i]
-                + (1.0 / (2.0 * np.pi))
-                * np.sum(lam * self.J[i, :])
-                + gamma / 2.0
-                - (gamma / (2.0 * np.pi))
-                * np.sum(self.L[i, :])
-            )
-
-            # Local surface velocity magnitude:
-            # |V|^2 = Vt^2 + vn^2
-            Cp[i] = 1.0 - (
-                Vt[i] ** 2 + vn[i] ** 2
-            ) / Vinf**2
-
+        # [eq:panel_x_force; eq:panel_y_force]
+        # Pressure force per panel: dC=-Cp*n*S_i/c over the full panel boundary.
+        # These are pressure loads; no extra jet momentum reaction is added.
         dCx = -Cp * self.geom.nx * self.geom.S / c
         dCy = -Cp * self.geom.ny * self.geom.S / c
 
+        # [eq:total_x_force; eq:total_y_force]
+        # Sum all N pressure-force contributions in body coordinates.
         Cx = float(np.sum(dCx))
         Cy = float(np.sum(dCy))
 
         alpha = np.deg2rad(self.flow.aoa_deg)
 
+        # [eq:lift_coefficient; eq:drag_coefficient]
+        # Rotate body-axis forces into lift and drag at alpha (radians).
+        # CD is pressure drag from this inviscid model, excluding viscous shear.
         CL = Cy * np.cos(alpha) - Cx * np.sin(alpha)
         CD = Cx * np.cos(alpha) + Cy * np.sin(alpha)
 
         xbar = self.geom.XC - self.ref.x_ref
         ybar = self.geom.YC - self.ref.y_ref
 
+        # [eq:moment_coefficient]
+        # Clockwise-positive moment about ref=(x_ref,y_ref); xbar/ybar still
+        # have length units, so division by c gives the paper moment coefficient.
         dCM = -(xbar * dCy - ybar * dCx) / c
         CM = float(np.sum(dCM))
 
+        # Additional diagnostic (no numbered equation in the supplied methods):
+        # Gamma=gamma*sum_i S_i; CL_kj=2*Gamma/(V_inf*c). Reported CL above is
+        # obtained from integrated pressure forces, not from this diagnostic.
         circulation = gamma * np.sum(self.geom.S)
         CL_kj = float(2.0 * circulation / (Vinf * c))
 
@@ -727,6 +875,8 @@ class SourceVortexPanelMethod:
 
     def panel_pressures(self, result: SPVPResult) -> np.ndarray:
         """Convert pressure coefficient to absolute panel pressure."""
+        # [eq:panel_pressure]
+        # p_i = p_inf + (rho*V_inf^2/2)*Cp_i.
         q_inf = 0.5 * self.flow.rho_inf * self.flow.v_inf**2
         return self.flow.p_inf + q_inf * result.Cp
 

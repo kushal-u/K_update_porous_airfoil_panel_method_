@@ -1,0 +1,90 @@
+{
+  "master_height_binding": "passed",
+  "per_stage_overrides": "passed",
+  "disabled_stages": "passed",
+  "metric_edge_cases": "passed",
+  "pipeline_status": "completed_with_unconverged_cases",
+  "sweep_cases": 27,
+  "converged_cases": 25,
+  "unconverged_coarse_mesh_cases": 2,
+  "png_files": 18,
+  "pipeline_elapsed_seconds": 20.97105560400041,
+  "stage_timings": [
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0546847270002217
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0517488340001364
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0509747020000759
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0344117079998795
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0344879819999732
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0331935610001892
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed",
+      "elapsed_seconds": 0.0661071810000066
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed_with_unconverged_cases",
+      "elapsed_seconds": 1.5910110970003188
+    },
+    {
+      "stage": "model_height_sweep",
+      "status": "completed_with_unconverged_cases",
+      "elapsed_seconds": 1.3065302579998388
+    },
+    {
+      "stage": "aoa_sweep",
+      "status": "completed_with_unconverged_cases",
+      "elapsed_seconds": 4.13926205100006
+    },
+    {
+      "stage": "aero_plots",
+      "status": "completed",
+      "elapsed_seconds": 2.820631949000017
+    },
+    {
+      "stage": "geometry",
+      "status": "completed",
+      "elapsed_seconds": 3.5543452209999487
+    },
+    {
+      "stage": "contours",
+      "status": "completed",
+      "elapsed_seconds": 5.683337465000022
+    },
+    {
+      "stage": "streamlines",
+      "status": "completed",
+      "elapsed_seconds": 4.747446146000129
+    },
+    {
+      "stage": "pipeline",
+      "status": "completed_with_unconverged_cases",
+      "elapsed_seconds": 20.97105560400041
+    }
+  ],
+  "external_integration_scope": "XFOIL and ParaView unavailable; disabled and verified never invoked"
+}

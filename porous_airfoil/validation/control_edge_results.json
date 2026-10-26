@@ -1,0 +1,8 @@
+{
+  "fixed_cases_without_plots": "3/3 converged; no disabled exports written",
+  "standalone_stage_toggles": "passed",
+  "channel_count_position_reference_controls": "passed",
+  "failure_timing_and_propagation": "passed",
+  "invalid_boolean_validation": "passed",
+  "companion_launcher": "passed"
+}

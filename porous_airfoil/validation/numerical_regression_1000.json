@@ -1,0 +1,8 @@
+{
+  "cases": 189,
+  "converged": 189,
+  "unconverged": [],
+  "max_accepted_residual": 2.648399672454625e-08,
+  "metric_consistency": "passed",
+  "sweep_order": "production workflow: nearest-zero anchor, then separate positive/negative branches"
+}

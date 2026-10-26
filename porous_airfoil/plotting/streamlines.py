@@ -19,6 +19,9 @@ Important:
 
 from __future__ import annotations
 
+from .. import config as settings
+from ..reporting import timed_stage, aerodynamic_change_metrics, print_case_metrics, report_aerodynamic_frame
+
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -61,68 +64,54 @@ from ..porous import (
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-STREAMLINE_AOA_DEG = 10
-STREAMLINE_PORE_DIAMETER_M = 0.0080
+STREAMLINE_AOA_DEG = settings.PLOT_STREAMLINE_STREAMLINE_AOA_DEG
+STREAMLINE_PORE_DIAMETER_M = settings.PLOT_STREAMLINE_STREAMLINE_PORE_DIAMETER_M
 
-STREAMLINE_MODEL_NAMES = (
-    "model_1_4_chordwise",
-    "model_2_9_perpendicular",
-    "model_3_combined_independent",
-)
+STREAMLINE_MODEL_NAMES = settings.PLOT_STREAMLINE_STREAMLINE_MODEL_NAMES
 
-MODEL_LABELS = {
-    "model_1_4_chordwise": "Horizontal",
-    "model_2_9_perpendicular": "Vertical",
-    "model_3_combined_independent": "Isotropic",
-    "model_4_saved_case_1": "Saved case",
-}
+MODEL_LABELS = settings.PLOT_STREAMLINE_MODEL_LABELS
 
-MODEL_FOLDER_NAMES = {
-    "model_1_4_chordwise": "horizontal",
-    "model_2_9_perpendicular": "vertical",
-    "model_3_combined_independent": "isotropic",
-    "model_4_saved_case_1": "saved_case",
-}
+MODEL_FOLDER_NAMES = settings.PLOT_STREAMLINE_MODEL_FOLDER_NAMES
 
-NORMAL_XLIM = (-0.50, 1.50)
-NORMAL_YLIM = (-0.50, 0.50)
+NORMAL_XLIM = settings.PLOT_STREAMLINE_NORMAL_XLIM
+NORMAL_YLIM = settings.PLOT_STREAMLINE_NORMAL_YLIM
 
-CLOSE_UP_XLIM = ZOOMED_CONTOUR_XLIM
-CLOSE_UP_YLIM = ZOOMED_CONTOUR_YLIM
+CLOSE_UP_XLIM = settings.PLOT_STREAMLINE_CLOSE_UP_XLIM
+CLOSE_UP_YLIM = settings.PLOT_STREAMLINE_CLOSE_UP_YLIM
 
-FIELD_NX = int(CONTOUR_NX)
-FIELD_NY = int(CONTOUR_NY)
+FIELD_NX = settings.PLOT_STREAMLINE_FIELD_NX
+FIELD_NY = settings.PLOT_STREAMLINE_FIELD_NY
 
-STREAMLINE_OUTPUT_ROOT = Path(OUTPUT_ROOT) / "streamline_results"
+STREAMLINE_OUTPUT_ROOT = settings.PLOT_STREAMLINE_STREAMLINE_OUTPUT_ROOT
 
-SAVE_FORMATS = ("png", "pdf", "svg")
-PNG_DPI = 1000
+SAVE_FORMATS = settings.PLOT_STREAMLINE_SAVE_FORMATS
+PNG_DPI = settings.PLOT_STREAMLINE_PNG_DPI
 
-VERBOSE_COUPLING = True
+VERBOSE_COUPLING = settings.PLOT_STREAMLINE_VERBOSE_COUPLING
 
 # Generate external streamlines from pore inlet and outlet locations.
-DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES = True
+DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES = settings.PLOT_STREAMLINE_DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES
 
 # Use the same pore-adjacent seed locations on the solid comparison panel.
-DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES_ON_SOLID = True
+DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES_ON_SOLID = settings.PLOT_STREAMLINE_DRAW_PORE_MOUTH_EXTERNAL_STREAMLINES_ON_SOLID
 
 # Options: "inlet", "outlet", or "both".
-PORE_MOUTH_EXTERNAL_SEED_ROLES = "outlet"
+PORE_MOUTH_EXTERNAL_SEED_ROLES = settings.PLOT_STREAMLINE_PORE_MOUTH_EXTERNAL_SEED_ROLES
 
 # One external streamline per pore mouth.
 # For three nearby streamlines per pore, use:
 # (-0.0015, 0.0, 0.0015)
-PORE_MOUTH_TANGENTIAL_OFFSETS_C = (0.0,)
+PORE_MOUTH_TANGENTIAL_OFFSETS_C = settings.PLOT_STREAMLINE_PORE_MOUTH_TANGENTIAL_OFFSETS_C
 
 # Prevent excessive streamline density in the isotropic model.
-MAX_PORE_MOUTH_EXTERNAL_SEEDS = 64
+MAX_PORE_MOUTH_EXTERNAL_SEEDS = settings.PLOT_STREAMLINE_MAX_PORE_MOUTH_EXTERNAL_SEEDS
 # =============================================================================
 # FIGURE CONTROLS
 # =============================================================================
-MAKE_STREAMLINE_PLOTS = True
+MAKE_STREAMLINE_PLOTS = settings.PLOT_STREAMLINE_MAKE_STREAMLINE_PLOTS
 
-DRAW_EXTERNAL_STREAMLINES = True
-DRAW_INTERNAL_CHANNEL_STREAMLINES = True
+DRAW_EXTERNAL_STREAMLINES = settings.PLOT_STREAMLINE_DRAW_EXTERNAL_STREAMLINES
+DRAW_INTERNAL_CHANNEL_STREAMLINES = settings.PLOT_STREAMLINE_DRAW_INTERNAL_CHANNEL_STREAMLINES
 
 # Internal streamline seeds are now exact pore-mouth seeds.
 # Options:
@@ -134,46 +123,46 @@ DRAW_INTERNAL_CHANNEL_STREAMLINES = True
 #   "both" can make the same channel look darker because inlet and outlet seeds
 #   may trace the same path from opposite ends. Use "inlet" for the cleanest
 #   one-line-per-channel visualisation while still exporting both pore locations.
-INTERNAL_STREAMLINE_SEED_ROLES = "inlet"
+INTERNAL_STREAMLINE_SEED_ROLES = settings.PLOT_STREAMLINE_INTERNAL_STREAMLINE_SEED_ROLES
 
-EXPORT_PORE_LOCATION_CSV = True
+EXPORT_PORE_LOCATION_CSV = settings.PLOT_STREAMLINE_EXPORT_PORE_LOCATION_CSV
 
 # External streamlines: solid black
-EXTERNAL_STREAMLINE_COLOR = "black"
-EXTERNAL_STREAMLINE_LINEWIDTH = 0.32
-EXTERNAL_STREAMLINE_ALPHA = 1.0
-EXTERNAL_STREAMLINE_LINESTYLE = "-"
+EXTERNAL_STREAMLINE_COLOR = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_COLOR
+EXTERNAL_STREAMLINE_LINEWIDTH = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_LINEWIDTH
+EXTERNAL_STREAMLINE_ALPHA = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_ALPHA
+EXTERNAL_STREAMLINE_LINESTYLE = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_LINESTYLE
 
 # Internal streamlines: dashed black
-INTERNAL_STREAMLINE_COLOR = "black"
-INTERNAL_STREAMLINE_LINEWIDTH = 0.32
-INTERNAL_STREAMLINE_ALPHA = 1.0
-INTERNAL_STREAMLINE_LINESTYLE = "--"
+INTERNAL_STREAMLINE_COLOR = settings.PLOT_STREAMLINE_INTERNAL_STREAMLINE_COLOR
+INTERNAL_STREAMLINE_LINEWIDTH = settings.PLOT_STREAMLINE_INTERNAL_STREAMLINE_LINEWIDTH
+INTERNAL_STREAMLINE_ALPHA = settings.PLOT_STREAMLINE_INTERNAL_STREAMLINE_ALPHA
+INTERNAL_STREAMLINE_LINESTYLE = settings.PLOT_STREAMLINE_INTERNAL_STREAMLINE_LINESTYLE
 
 # Airfoil style
-AIRFOIL_FILL = "#D9D9D9"   # light grey
-AIRFOIL_EDGE = "black"
-AIRFOIL_EDGE_WIDTH = 0.70
+AIRFOIL_FILL = settings.PLOT_STREAMLINE_AIRFOIL_FILL
+AIRFOIL_EDGE = settings.PLOT_STREAMLINE_AIRFOIL_EDGE
+AIRFOIL_EDGE_WIDTH = settings.PLOT_STREAMLINE_AIRFOIL_EDGE_WIDTH
 
 
 # =============================================================================
 # CONTINUOUS STREAMLINE CONTROLS
 # =============================================================================
-EXTERNAL_STREAMLINE_COUNT_NORMAL = 75
-EXTERNAL_STREAMLINE_COUNT_CLOSE = 25
+EXTERNAL_STREAMLINE_COUNT_NORMAL = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_COUNT_NORMAL
+EXTERNAL_STREAMLINE_COUNT_CLOSE = settings.PLOT_STREAMLINE_EXTERNAL_STREAMLINE_COUNT_CLOSE
 
-STREAMLINE_START_X_OFFSET_C = 0.015
-STREAMLINE_Y_MARGIN_C = 0.015
+STREAMLINE_START_X_OFFSET_C = settings.PLOT_STREAMLINE_STREAMLINE_START_X_OFFSET_C
+STREAMLINE_Y_MARGIN_C = settings.PLOT_STREAMLINE_STREAMLINE_Y_MARGIN_C
 
-STREAMLINE_MAX_STEP_C = 0.004
-STREAMLINE_RTOL = 1.0e-6
-STREAMLINE_ATOL = 1.0e-8
+STREAMLINE_MAX_STEP_C = settings.PLOT_STREAMLINE_STREAMLINE_MAX_STEP_C
+STREAMLINE_RTOL = settings.PLOT_STREAMLINE_STREAMLINE_RTOL
+STREAMLINE_ATOL = settings.PLOT_STREAMLINE_STREAMLINE_ATOL
 
-STREAMLINE_MIN_POINTS = 5
-STREAMLINE_MIN_LENGTH_C = 0.015
+STREAMLINE_MIN_POINTS = settings.PLOT_STREAMLINE_STREAMLINE_MIN_POINTS
+STREAMLINE_MIN_LENGTH_C = settings.PLOT_STREAMLINE_STREAMLINE_MIN_LENGTH_C
 
 # Maximum integration distance in multiples of the plotting-window diagonal.
-STREAMLINE_MAX_DISTANCE_FACTOR = 3.0
+STREAMLINE_MAX_DISTANCE_FACTOR = settings.PLOT_STREAMLINE_STREAMLINE_MAX_DISTANCE_FACTOR
 
 
 # =============================================================================
@@ -182,18 +171,18 @@ STREAMLINE_MAX_DISTANCE_FACTOR = 3.0
 # The channel corridor is used only for approximate internal streamline
 # visualisation. It allows the continuous integrator to pass through the body
 # along the internal hydraulic path.
-INTERNAL_CHANNEL_CORRIDOR_RADIUS_FACTOR = 0.55
-INTERNAL_CHANNEL_MIN_RADIUS_C = 0.002
+INTERNAL_CHANNEL_CORRIDOR_RADIUS_FACTOR = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_CORRIDOR_RADIUS_FACTOR
+INTERNAL_CHANNEL_MIN_RADIUS_C = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_MIN_RADIUS_C
 
 # Extend the internal channel corridor slightly beyond the two pore mouths.
 # This helps exact pore-mouth seeds connect to the internal corridor.
-INTERNAL_CHANNEL_END_CAP_FACTOR = 1.20
+INTERNAL_CHANNEL_END_CAP_FACTOR = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_END_CAP_FACTOR
 
 # "plug" or "parabolic"
-INTERNAL_CHANNEL_PROFILE = "plug"
+INTERNAL_CHANNEL_PROFILE = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_PROFILE
 
-INTERNAL_CHANNEL_MIN_AREA = 1.0e-14
-INTERNAL_CHANNEL_FALLBACK_DIAMETER_M = STREAMLINE_PORE_DIAMETER_M
+INTERNAL_CHANNEL_MIN_AREA = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_MIN_AREA
+INTERNAL_CHANNEL_FALLBACK_DIAMETER_M = settings.PLOT_STREAMLINE_INTERNAL_CHANNEL_FALLBACK_DIAMETER_M
 
 
 # =============================================================================
@@ -201,8 +190,8 @@ INTERNAL_CHANNEL_FALLBACK_DIAMETER_M = STREAMLINE_PORE_DIAMETER_M
 # =============================================================================
 # These are used only in the CSV. Internal streamline seeds are placed exactly
 # on the pore mouth. External-offset seed locations are also saved for reference.
-PORE_EXTERNAL_SEED_OFFSET_C_NORMAL = 0.006
-PORE_EXTERNAL_SEED_OFFSET_C_CLOSE = 0.004
+PORE_EXTERNAL_SEED_OFFSET_C_NORMAL = settings.PLOT_STREAMLINE_PORE_EXTERNAL_SEED_OFFSET_C_NORMAL
+PORE_EXTERNAL_SEED_OFFSET_C_CLOSE = settings.PLOT_STREAMLINE_PORE_EXTERNAL_SEED_OFFSET_C_CLOSE
 
 # Streamline integration direction options:
 #   "forward"  = integrate along the local velocity direction
@@ -210,78 +199,53 @@ PORE_EXTERNAL_SEED_OFFSET_C_CLOSE = 0.004
 #   "both"     = integrate forward and backward, then join both branches
 #
 # For left-boundary farfield seeds, "forward" is recommended.
-FARFIELD_STREAMLINE_DIRECTION = "forward"
+FARFIELD_STREAMLINE_DIRECTION = settings.PLOT_STREAMLINE_FARFIELD_STREAMLINE_DIRECTION
 
 # For pore inlet/outlet seeds, "both" normally gives the clearest full line.
-PORE_MOUTH_STREAMLINE_DIRECTION = "forward"
+PORE_MOUTH_STREAMLINE_DIRECTION = settings.PLOT_STREAMLINE_PORE_MOUTH_STREAMLINE_DIRECTION
 # =============================================================================
 # PLOT STYLE
 # =============================================================================
 def apply_publication_style() -> None:
-    """Apply a clean paper-friendly Matplotlib style."""
-    mpl.rcParams.update(
-        {
-            "figure.dpi": 160,
-            "savefig.dpi": PNG_DPI,
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "DejaVu Sans"],
-            "mathtext.fontset": "custom",
-            "mathtext.rm": "Arial",
-            "mathtext.it": "Arial:italic",
-            "mathtext.bf": "Arial:bold",
-            "axes.linewidth": 0.85,
-            "axes.labelsize": 10.5,
-            "axes.titlesize": 10.5,
-            "xtick.labelsize": 9.5,
-            "ytick.labelsize": 9.5,
-            "legend.fontsize": 8.5,
-            "figure.titlesize": 11.5,
-            "xtick.direction": "in",
-            "ytick.direction": "in",
-            "xtick.top": True,
-            "ytick.right": True,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-        }
-    )
+    """Use the central Matplotlib style configuration."""
+    mpl.rcParams.update(settings.PLOT_STREAMLINE_RCPARAMS)
 
 # =============================================================================
 # STREAMLINE DIRECTION ARROWS
 # =============================================================================
-DRAW_STREAMLINE_ARROWS = True
+DRAW_STREAMLINE_ARROWS = settings.PLOT_STREAMLINE_DRAW_STREAMLINE_ARROWS
 
 # Number of arrows per streamline.
 # Use 1 for clean figures. Use 2 if the streamlines are long.
-STREAMLINE_ARROW_COUNT = 1
+STREAMLINE_ARROW_COUNT = settings.PLOT_STREAMLINE_STREAMLINE_ARROW_COUNT
 
 # Arrow positions along each streamline.
 # Used only when STREAMLINE_ARROW_COUNT = 1.
-STREAMLINE_ARROW_POSITION_FRACTION = 0.58
+STREAMLINE_ARROW_POSITION_FRACTION = settings.PLOT_STREAMLINE_STREAMLINE_ARROW_POSITION_FRACTION
 
 # Arrow size in plot coordinates.
-STREAMLINE_ARROW_LENGTH_C = 0.030
-STREAMLINE_ARROW_MUTATION_SCALE = 6.0
+STREAMLINE_ARROW_LENGTH_C = settings.PLOT_STREAMLINE_STREAMLINE_ARROW_LENGTH_C
+STREAMLINE_ARROW_MUTATION_SCALE = settings.PLOT_STREAMLINE_STREAMLINE_ARROW_MUTATION_SCALE
 
 # Skip arrows on very short streamlines.
-STREAMLINE_ARROW_MIN_LINE_LENGTH_C = 0.050
+STREAMLINE_ARROW_MIN_LINE_LENGTH_C = settings.PLOT_STREAMLINE_STREAMLINE_ARROW_MIN_LINE_LENGTH_C
 
 # =============================================================================
 # INTERNAL CHANNEL FLOW-DIRECTION ARROWS
 # =============================================================================
-DRAW_INTERNAL_FLOW_DIRECTION_ARROWS = True
+DRAW_INTERNAL_FLOW_DIRECTION_ARROWS = settings.PLOT_STREAMLINE_DRAW_INTERNAL_FLOW_DIRECTION_ARROWS
 
 # Position of the arrow along each internal channel.
 # 0.50 means centre of the internal channel.
-INTERNAL_ARROW_POSITION_FRACTION = 0.50
+INTERNAL_ARROW_POSITION_FRACTION = settings.PLOT_STREAMLINE_INTERNAL_ARROW_POSITION_FRACTION
 
 # Arrow length in chord-normalised coordinates.
-INTERNAL_ARROW_LENGTH_C = 0.040
+INTERNAL_ARROW_LENGTH_C = settings.PLOT_STREAMLINE_INTERNAL_ARROW_LENGTH_C
 
 # Use slightly darker grey than the streamlines so the direction is visible.
-INTERNAL_ARROW_COLOR = "black"
-INTERNAL_ARROW_LINEWIDTH = 0.50
-INTERNAL_ARROW_MUTATION_SCALE = 8.0
+INTERNAL_ARROW_COLOR = settings.PLOT_STREAMLINE_INTERNAL_ARROW_COLOR
+INTERNAL_ARROW_LINEWIDTH = settings.PLOT_STREAMLINE_INTERNAL_ARROW_LINEWIDTH
+INTERNAL_ARROW_MUTATION_SCALE = settings.PLOT_STREAMLINE_INTERNAL_ARROW_MUTATION_SCALE
 
 # =============================================================================
 # DATA CONTAINERS
@@ -394,11 +358,13 @@ def diameter_label_mm(diameter_m: float) -> str:
 
 
 def streamline_views() -> tuple[StreamlineView, ...]:
-    """Return normal and close-up views."""
-    return (
-        #StreamlineView("normal", "Normal view", NORMAL_XLIM, NORMAL_YLIM),
-        StreamlineView("close_up", "Close-up view", CLOSE_UP_XLIM, CLOSE_UP_YLIM),
-    )
+    """Return the views enabled in config.py."""
+    views = []
+    if settings.PLOT_STREAMLINE_EXPORT_NORMAL_VIEW:
+        views.append(StreamlineView("normal", "Normal view", NORMAL_XLIM, NORMAL_YLIM))
+    if settings.PLOT_STREAMLINE_EXPORT_CLOSE_UP_VIEW:
+        views.append(StreamlineView("close_up", "Close-up view", CLOSE_UP_XLIM, CLOSE_UP_YLIM))
+    return tuple(views)
 
 
 def model_label(model_name: str) -> str:
@@ -1790,6 +1756,7 @@ def run_one_streamline_model(
     output_root: Path,
 ) -> dict:
     """Solve one porous model and export its streamline figures."""
+    case_started = time.perf_counter()
     label = model_label(model.name)
     folder_name = model_folder_name(model.name)
 
@@ -1841,6 +1808,12 @@ def run_one_streamline_model(
         }
 
         summary_path = model_dir / "streamline_case_summary.csv"
+        summary.update(aerodynamic_change_metrics(solid_result, coupled.aero_result, coupled.converged))
+        summary["channel_height_m"] = representative_pore_diameter(model)
+        summary["solve_elapsed_seconds"] = elapsed
+        summary["elapsed_seconds"] = time.perf_counter()-case_started
+        if settings.PRINT_METRICS_PER_CASE:
+            print_case_metrics(summary, model.name)
         write_csv(summary_path, summary)
         print(f"[CSV Saved] {summary_path}")
 
@@ -1913,9 +1886,7 @@ def run_one_streamline_model(
         "porous_CM": float(coupled.aero_result.CM),
         "delta_CL": float(coupled.aero_result.CL - solid_result.CL),
         "delta_CM": float(coupled.aero_result.CM - solid_result.CM),
-        "gain_percent_vs_solid_panel": float(
-            100.0 * (coupled.aero_result.CL / solid_result.CL - 1.0)
-        ),
+
         "coupling_converged": True,
         "coupling_iterations": int(coupled.iterations),
         "max_vn_m_s": float(coupled.max_vn),
@@ -1924,6 +1895,12 @@ def run_one_streamline_model(
     }
 
     summary_path = model_dir / "streamline_case_summary.csv"
+    summary.update(aerodynamic_change_metrics(solid_result, coupled.aero_result, coupled.converged))
+    summary["channel_height_m"] = representative_pore_diameter(model)
+    summary["solve_elapsed_seconds"] = elapsed
+    summary["elapsed_seconds"] = time.perf_counter()-case_started
+    if settings.PRINT_METRICS_PER_CASE:
+        print_case_metrics(summary, model.name)
     write_csv(summary_path, summary)
     print(f"[CSV Saved] {summary_path}")
 
@@ -1933,7 +1910,11 @@ def run_one_streamline_model(
 # =============================================================================
 # MAIN
 # =============================================================================
+@timed_stage("streamlines")
 def main() -> None:
+    if not (settings.ENABLE_PLOTS and settings.RUN_STREAMLINES):
+        print("[Skip] streamlines disabled in config.py.")
+        return {"status": "skipped", "message": "disabled in config.py"}
     apply_publication_style()
 
     aoa_label = format_float_label(STREAMLINE_AOA_DEG, decimals=2)
@@ -2036,6 +2017,8 @@ def main() -> None:
             output_root=output_root,
         )
         summary_rows.append(row)
+
+    report_aerodynamic_frame(pd.DataFrame(summary_rows), output_root, "streamline_aerodynamic_change_metrics")
 
     combined_summary_path = output_root / "all_streamline_cases_summary.csv"
     write_csv(combined_summary_path, summary_rows)

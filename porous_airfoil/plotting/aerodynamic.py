@@ -7,6 +7,9 @@ unchanged while the code now lives inside the package.
 
 from __future__ import annotations
 
+from .. import config as settings
+from ..reporting import timed_stage, aerodynamic_change_metrics, print_case_metrics, report_aerodynamic_frame
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -92,7 +95,7 @@ def plot_airfoil_with_porous_network(
         ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=6)
 
     fig.tight_layout()
-    _save_figure(fig, save_path, dpi=300, bbox_inches="tight")
+    _save_figure(fig, save_path, dpi=settings.AERODYNAMIC_PNG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot Saved] {save_path}")
 
@@ -128,7 +131,7 @@ def plot_cp_distribution_with_xfoil(
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    _save_figure(fig, save_path, dpi=300, bbox_inches="tight")
+    _save_figure(fig, save_path, dpi=settings.AERODYNAMIC_PNG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot Saved] {save_path}")
 
@@ -182,7 +185,7 @@ def plot_aoa_sweep_comparison(sweep_df, output_dir: str | Path) -> None:
             ax.legend(fontsize=8)
 
     fig.tight_layout()
-    _save_figure(fig, save_path, dpi=300, bbox_inches="tight")
+    _save_figure(fig, save_path, dpi=settings.AERODYNAMIC_PNG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot Saved] {save_path}")
 
@@ -230,8 +233,8 @@ def plot_velocity_contours_comparison(
     solid_solver,
     solid_result,
     output_dir: str | Path,
-    xlim: tuple[float, float] = (-0.5, 1.5),
-    ylim: tuple[float, float] = (-0.5, 0.5),
+    xlim: tuple[float, float] = settings.NORMAL_CONTOUR_XLIM,
+    ylim: tuple[float, float] = settings.NORMAL_CONTOUR_YLIM,
     nx: int = 1000,
     ny: int = 1000,
     save_filename: str = "velocity_contours_comparison.png",
@@ -253,7 +256,7 @@ def plot_velocity_contours_comparison(
     _format_contour_axis(axes[1], solid_solver.geom, xlim, ylim, f"Velocity Magnitude: Solid{label}")
     colorbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.95)
     colorbar.set_label("Velocity magnitude [m/s]")
-    _save_figure(fig, save_path, dpi=300, bbox_inches="tight")
+    _save_figure(fig, save_path, dpi=settings.AERODYNAMIC_PNG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot Saved] {save_path}")
 
@@ -264,8 +267,8 @@ def plot_pressure_contours_comparison(
     solid_solver,
     solid_result,
     output_dir: str | Path,
-    xlim: tuple[float, float] = (-0.2, 1.2),
-    ylim: tuple[float, float] = (-0.35, 0.35),
+    xlim: tuple[float, float] = settings.NORMAL_CONTOUR_XLIM,
+    ylim: tuple[float, float] = settings.NORMAL_CONTOUR_YLIM,
     nx: int = 1000,
     ny: int = 1000,
     save_filename: str = "pressure_contours_comparison.png",
@@ -287,7 +290,7 @@ def plot_pressure_contours_comparison(
     _format_contour_axis(axes[1], solid_solver.geom, xlim, ylim, f"Static Pressure: Solid{label}")
     colorbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.95)
     colorbar.set_label("Pressure [Pa]")
-    _save_figure(fig, save_path, dpi=300, bbox_inches="tight")
+    _save_figure(fig, save_path, dpi=settings.AERODYNAMIC_PNG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot Saved] {save_path}")
 
@@ -311,92 +314,49 @@ import pandas as pd
 # =============================================================================
 # Set an exact sweep CSV here when possible. When None, the script searches
 # recursively inside SEARCH_ROOT.
-INPUT_CSV_PATH: Path | None = None
+INPUT_CSV_PATH = settings.PLOT_AERO_INPUT_CSV_PATH
 
-try:
-    from ..config import OUTPUT_ROOT
+SEARCH_ROOT = settings.PLOT_AERO_SEARCH_ROOT
 
-    SEARCH_ROOT = Path(OUTPUT_ROOT)
-except Exception:
-    SEARCH_ROOT = Path(__file__).resolve().parents[2] / "outputs"
-
-OUTPUT_DIR = SEARCH_ROOT / "aero_graphs_three_diameters"
+OUTPUT_DIR = settings.PLOT_AERO_OUTPUT_DIR
 
 # Three diameters compared in every model panel.
-SELECT_PORE_DIAMETERS_M = (
-    0.0060,
-    0.0070,
-    0.0080,
-)
+SELECT_PORE_DIAMETERS_M = settings.PLOT_AERO_SELECT_PORE_DIAMETERS_M
 
 # Retain the original validation/reference curves.
-SHOW_SOLID_REFERENCE = True
-SHOW_XFOIL_REFERENCE = True
+SHOW_SOLID_REFERENCE = settings.PLOT_AERO_SHOW_SOLID_REFERENCE
+SHOW_XFOIL_REFERENCE = settings.PLOT_AERO_SHOW_XFOIL_REFERENCE
 
-SAVE_FORMATS = ("png", "pdf", "svg")
-PNG_DPI = 1000
+SAVE_FORMATS = settings.PLOT_AERO_SAVE_FORMATS
+PNG_DPI = settings.PLOT_AERO_PNG_DPI
 
 # False gives colour curves that are also differentiated by line type.
 # True makes all curves black while preserving line-style differences.
-MONOCHROME_MODE = False
+MONOCHROME_MODE = settings.PLOT_AERO_MONOCHROME_MODE
 
 # Three panels in one journal-width row.
-THREE_PANEL_FIGSIZE = (7.5, 3.15)
+THREE_PANEL_FIGSIZE = settings.PLOT_AERO_THREE_PANEL_FIGSIZE
 
 # Use a common y-axis across the three models for direct comparison.
-SHARE_Y_AXIS = True
+SHARE_Y_AXIS = settings.PLOT_AERO_SHARE_Y_AXIS
 
 
 # =============================================================================
 # MODEL LABELS AND PANEL ORDER
 # =============================================================================
-CASE_LABELS = {
-    "model_1_4_chordwise": "Horizontal",
-    "model_2_9_perpendicular": "Vertical",
-    "model_2_4_perpendicular": "Vertical",
-    "model_3_combined_independent": "Horizontal + Vertical",
-    "horizontal": "Horizontal",
-    "vertical": "Vertical",
-    "isotropic": "Horizontal + Vertical",
-    "horizontal + vertical": "Horizontal + Vertical",
-    "solid": "Solid panel",
-    "solid_panel": "Solid panel",
-    "solid panel": "Solid panel",
-    "xfoil": "XFOIL",
-}
+CASE_LABELS = settings.PLOT_AERO_CASE_LABELS
 
-MODEL_PANELS = (
-    ("Horizontal", "(a) Horizontal"),
-    ("Vertical", "(b) Vertical"),
-    ("Horizontal + Vertical", "(c) Horizontal + Vertical"),
-)
+MODEL_PANELS = settings.PLOT_AERO_MODEL_PANELS
 
 
 # =============================================================================
 # CURVE STYLES
 # =============================================================================
 # Diameter is encoded by line type only. Colour is an additional aid.
-DIAMETER_LINESTYLES = ("-", "--", "-.")
-DIAMETER_COLOURS = ("#0072B2", "#D55E00", "#009E73")
+DIAMETER_LINESTYLES = settings.PLOT_AERO_DIAMETER_LINESTYLES
+DIAMETER_COLOURS = settings.PLOT_AERO_DIAMETER_COLOURS
 
-REFERENCE_STYLES = {
-    "Solid panel": {
-        "color": "black",
-        "linestyle": ":",
-        "marker": "",
-        "linewidth": 1.65,
-        "markersize": 0.0,
-        "zorder": 3,
-    },
-    "XFOIL": {
-        "color": "#666666",
-        "linestyle": (0, (5, 2)),
-        "marker": "",
-        "linewidth": 1.45,
-        "markersize": 0.0,
-        "zorder": 2,
-    },
-}
+REFERENCE_STYLES = settings.PLOT_AERO_REFERENCE_STYLES
 
 
 # =============================================================================
@@ -406,7 +366,7 @@ REFERENCE_STYLES = {
 from pathlib import Path
 from matplotlib import font_manager
 
-WINDOWS_FONT_DIR = Path("/mnt/c/Windows/Fonts")
+WINDOWS_FONT_DIR = settings.PLOT_AERO_WINDOWS_FONT_DIR
 
 arial_files = [
     WINDOWS_FONT_DIR / "arial.ttf",
@@ -420,33 +380,8 @@ for font_path in arial_files:
         font_manager.fontManager.addfont(str(font_path))
 
 def apply_journal_style() -> None:
-    """Apply clean journal-style Matplotlib settings."""
-    mpl.rcParams.update(
-        {
-            "figure.dpi": 160,
-            "savefig.dpi": PNG_DPI,
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "DejaVu Sans"],
-            "mathtext.fontset": "custom",
-            "mathtext.rm": "Arial",
-            "mathtext.it": "Arial:italic",
-            "mathtext.bf": "Arial:bold",
-            "axes.linewidth": 0.85,
-            "axes.labelsize": 9.8,
-            "axes.titlesize": 10.0,
-            "xtick.labelsize": 8.8,
-            "ytick.labelsize": 8.8,
-            "legend.fontsize": 8.0,
-            "xtick.direction": "in",
-            "ytick.direction": "in",
-            "xtick.top": True,
-            "ytick.right": True,
-            "axes.grid": False,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-        }
-    )
+    """Use the central Matplotlib style configuration."""
+    mpl.rcParams.update(settings.PLOT_AERO_RCPARAMS)
 
 
 def windows_long_path(path: Path) -> str:
@@ -527,6 +462,10 @@ def infer_case_from_path(path: Path) -> str:
 def infer_diameter_from_text(text: str) -> float:
     """Infer a pore diameter in metres from text such as D=9 mm or D_9p00mm."""
     normalised = str(text).replace("p", ".")
+
+    authoritative = Path(SEARCH_ROOT) / "aoa_sweep" / "selected_models_aoa_sweep_summary.csv"
+    if authoritative.is_file():
+        return [authoritative]
 
     patterns = (
         r"(?:^|[_\-\s])D(?:=|[_\-\s])?([0-9]+(?:\.[0-9]+)?)\s*mm",
@@ -644,6 +583,7 @@ def extract_diameter_series(path: Path, df: pd.DataFrame) -> pd.Series:
     diameter_m_col = first_existing_column(
         df,
         (
+            "channel_height_m",
             "pore_diameter_m",
             "diameter_m",
             "pore_diameter",
@@ -705,22 +645,30 @@ def load_wide_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
 
         porous_cl = pd.to_numeric(row.get("porous_CL"), errors="coerce")
         porous_cm = pd.to_numeric(row.get("porous_CM", np.nan), errors="coerce")
+        porous_cd = pd.to_numeric(row.get("porous_CD", np.nan), errors="coerce")
 
-        if diameter_is_selected(float(diameter_m)) and np.isfinite(porous_cl):
+        flag = row.get("coupling_converged", True)
+        valid = str(flag).lower() in ("true", "1", "1.0") if isinstance(flag, str) else bool(pd.notna(flag) and flag)
+        if not valid:
+            porous_cl = porous_cd = porous_cm = np.nan
+        if diameter_is_selected(float(diameter_m)):
             rows.append(
                 {
                     "alpha_deg": float(alpha),
                     "base_case": model,
                     "pore_diameter_m": float(diameter_m),
                     "CL": float(porous_cl),
+                    "CD": float(porous_cd),
+                    "coupling_converged": valid,
                     "CM": float(porous_cm) if np.isfinite(porous_cm) else np.nan,
                     "source_file": str(path),
                 }
             )
 
-        solid_cl = pd.to_numeric(row.get("solid_panel_CL", np.nan), errors="coerce")
-        solid_cm = pd.to_numeric(row.get("solid_panel_CM", np.nan), errors="coerce")
+        solid_cl = pd.to_numeric(row.get("solid_panel_CL", row.get("solid_CL", np.nan)), errors="coerce")
+        solid_cm = pd.to_numeric(row.get("solid_panel_CM", row.get("solid_CM", np.nan)), errors="coerce")
 
+        solid_cd = pd.to_numeric(row.get("solid_panel_CD", row.get("solid_CD", np.nan)), errors="coerce")
         if np.isfinite(solid_cl):
             rows.append(
                 {
@@ -728,6 +676,7 @@ def load_wide_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
                     "base_case": "Solid panel",
                     "pore_diameter_m": np.nan,
                     "CL": float(solid_cl),
+                    "CD": float(solid_cd),
                     "CM": float(solid_cm) if np.isfinite(solid_cm) else np.nan,
                     "source_file": str(path),
                 }
@@ -736,6 +685,7 @@ def load_wide_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
         xfoil_cl = pd.to_numeric(row.get("xfoil_CL", np.nan), errors="coerce")
         xfoil_cm = pd.to_numeric(row.get("xfoil_CM", np.nan), errors="coerce")
 
+        xfoil_cd = pd.to_numeric(row.get("xfoil_CD", np.nan), errors="coerce")
         if np.isfinite(xfoil_cl):
             rows.append(
                 {
@@ -743,6 +693,7 @@ def load_wide_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
                     "base_case": "XFOIL",
                     "pore_diameter_m": np.nan,
                     "CL": float(xfoil_cl),
+                    "CD": float(xfoil_cd),
                     "CM": float(xfoil_cm) if np.isfinite(xfoil_cm) else np.nan,
                     "source_file": str(path),
                 }
@@ -773,6 +724,7 @@ def load_long_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
     if alpha_col is None or case_col is None or cl_col is None:
         return pd.DataFrame()
 
+    cd_col = first_existing_column(df, ("CD", "C_D", "cd", "c_d"))
     diameter_series = extract_diameter_series(path, df)
     raw_cases = df[case_col].astype(str)
 
@@ -781,6 +733,7 @@ def load_long_sweep_csv(path: Path, df: pd.DataFrame) -> pd.DataFrame:
     out["base_case"] = raw_cases.map(standardise_case_name)
     out["pore_diameter_m"] = pd.to_numeric(diameter_series, errors="coerce")
     out["CL"] = pd.to_numeric(df[cl_col], errors="coerce")
+    out["CD"] = pd.to_numeric(df[cd_col], errors="coerce") if cd_col is not None else np.nan
     out["CM"] = (
         pd.to_numeric(df[cm_col], errors="coerce")
         if cm_col is not None
@@ -847,7 +800,7 @@ def load_all_sweep_data() -> pd.DataFrame:
 
     data = pd.concat(loaded, ignore_index=True)
     data = data.replace([np.inf, -np.inf], np.nan)
-    data = data.dropna(subset=["alpha_deg", "base_case", "CL"])
+    data = data.dropna(subset=["alpha_deg", "base_case"])
 
     # Remove exact duplicated exports. Curve-level averaging is performed only
     # during plotting to avoid repeated baseline values from multiple model rows.
@@ -857,6 +810,7 @@ def load_all_sweep_data() -> pd.DataFrame:
             "base_case",
             "pore_diameter_m",
             "CL",
+            "CD",
             "CM",
         ],
         keep="first",
@@ -870,7 +824,7 @@ def load_all_sweep_data() -> pd.DataFrame:
 # =============================================================================
 def average_curve_by_alpha(df_curve: pd.DataFrame, metric: str) -> pd.DataFrame:
     """Return one ordered value per AoA for a curve."""
-    curve = df_curve.dropna(subset=["alpha_deg", metric]).copy()
+    curve = df_curve.dropna(subset=["alpha_deg"]).copy()
 
     if curve.empty:
         return curve
@@ -1091,14 +1045,15 @@ def plot_three_panel_metric(
 
     fig, axes = plt.subplots(
         1,
-        3,
+        len(MODEL_PANELS),
         figsize=THREE_PANEL_FIGSIZE,
+        squeeze=False,
         sharex=True,
         sharey=SHARE_Y_AXIS,
     )
 
     for panel_index, (ax, (model_name, panel_title)) in enumerate(
-        zip(axes, MODEL_PANELS)
+        zip(axes.ravel(), MODEL_PANELS)
     ):
         plot_reference_curves(
             ax=ax,
@@ -1156,20 +1111,33 @@ def plot_three_panel_metric(
 
 
 def plot_cl_and_cm_figures(data: pd.DataFrame) -> None:
-    """Export the requested three-panel CL and CM figures."""
-    plot_three_panel_metric(
-        data=data,
-        metric="CL",
-        ylabel=r"Lift coefficient, $C_L$",
-        output_filename="CL_vs_AoA_three_models_three_diameters",
-    )
+    """Export configured coefficients (including pressure drag when requested)."""
+    labels = {"CL": r"Lift coefficient, $C_L$", "CD": r"Pressure-drag coefficient, $C_D$",
+              "CM": r"Pitching moment coefficient, $C_M$"}
+    for metric in settings.PLOT_AERO_METRICS:
+        plot_three_panel_metric(data, metric, labels[metric], f"{metric}_vs_AoA_models_heights")
 
-    plot_three_panel_metric(
-        data=data,
-        metric="CM",
-        ylabel=r"Pitching moment coefficient, $C_M$",
-        output_filename="CM_vs_AoA_three_models_three_diameters",
-    )
+
+def report_plotting_metrics(data):
+    """Match each porous curve to its same-file, same-angle solid reference."""
+    references = data[data["base_case"] == "Solid panel"]
+    rows = []
+    for _, row in data[~data["base_case"].isin(["Solid panel", "XFOIL"])].iterrows():
+        baseline = references.loc[(references["source_file"] == row["source_file"])
+                                  & np.isclose(references["alpha_deg"], row["alpha_deg"], rtol=0., atol=1e-10)]
+        if baseline.empty:
+            solid = {key: np.nan for key in ("CL", "CD", "CM")}
+        else:
+            solid = {key: baseline[key].mean() for key in ("CL", "CD", "CM")}
+        result = {"model_name": row["base_case"], "alpha_deg": row["alpha_deg"],
+                  "channel_height_m": row["pore_diameter_m"], "source_file": row["source_file"],
+                  "coupling_converged": bool(np.isfinite(row["CL"]))}
+        result.update({"solid_"+key: solid[key] for key in solid})
+        result.update({"porous_"+key: row[key] for key in solid})
+        rows.append(result)
+    if rows:
+        return report_aerodynamic_frame(pd.DataFrame(rows), OUTPUT_DIR)
+    return pd.DataFrame()
 
 
 # =============================================================================
@@ -1209,12 +1177,16 @@ def print_curve_summary(data: pd.DataFrame) -> None:
 # =============================================================================
 # MAIN
 # =============================================================================
+@timed_stage("aero_plots")
 def main() -> None:
+    if not (settings.ENABLE_PLOTS and settings.RUN_AERODYNAMIC_PLOTS):
+        print("[Skip] aero_plots disabled in config.py.")
+        return {"status": "skipped", "message": "disabled in config.py"}
     apply_journal_style()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
-    print("CREATING THREE-PANEL CL AND CM FIGURES")
+    print("CREATING CONFIGURED AERODYNAMIC FIGURES")
     print("=" * 80)
     print(f"Search root              : {SEARCH_ROOT}")
     print(f"Output folder            : {OUTPUT_DIR}")
@@ -1239,6 +1211,7 @@ def main() -> None:
     print(f"[Saved] {plotting_csv}")
 
     print_curve_summary(data)
+    report_plotting_metrics(data)
     plot_cl_and_cm_figures(data)
 
     print("=" * 80)

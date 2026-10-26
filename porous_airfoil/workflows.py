@@ -8,6 +8,11 @@ inside the solver modules.
 from __future__ import annotations
 
 from pathlib import Path
+import importlib
+import time
+
+from . import config as settings
+from .reporting import timed_stage, report_aerodynamic_frame
 
 import pandas as pd
 import numpy as np
@@ -141,8 +146,12 @@ def _build_model_by_name(geom, model_name: str, channel_height_m: float) -> Poro
     return matches[0]
 
 
+@timed_stage("fixed_cases")
 def run_fixed_cases() -> pd.DataFrame:
     """Run configured fixed-angle porous-airfoil cases once per channel height."""
+    if not settings.RUN_FIXED_CASES:
+        print("[Skip] Fixed cases disabled in config.py.")
+        return pd.DataFrame()
     n_panels = int(N_PANELS)
     contour_nx = int(CONTOUR_NX)
     contour_ny = int(CONTOUR_NY)
@@ -191,8 +200,8 @@ def run_fixed_cases() -> pd.DataFrame:
             geom=geom,
             aero_solver=aero_solver,
             solid_result=solid_result,
-            field_nx=contour_nx,
-            field_ny=contour_ny,
+            field_nx=int(settings.PARAVIEW_FIELD_NX),
+            field_ny=int(settings.PARAVIEW_FIELD_NY),
         )
     else:
         print("[ParaView] Fixed-AoA ParaView export disabled.")
@@ -236,7 +245,7 @@ def run_fixed_cases() -> pd.DataFrame:
             )
             rows.append(row)
 
-    summary = pd.DataFrame(rows)
+    summary = report_aerodynamic_frame(pd.DataFrame(rows), output_root, "fixed_aerodynamic_change_metrics")
     combined_path = output_root / "all_models_summary.csv"
     summary.to_csv(combined_path, index=False)
     print(f"[CSV Saved] {combined_path}")
@@ -312,8 +321,8 @@ def run_sweep_for_model(
             paraview_output_dir=(
                 model_dir / "aoa_sweep_paraview" / _height_label(channel_height_m)
             ),
-            field_nx=int(CONTOUR_NX),
-            field_ny=int(CONTOUR_NY),
+            field_nx=int(settings.PARAVIEW_FIELD_NX),
+            field_ny=int(settings.PARAVIEW_FIELD_NY),
         )
         frames.append(frame)
 
@@ -340,12 +349,17 @@ def run_sweep_for_model(
     if not failed.empty:
         print(f"[Warning] {len(failed)} cases invalid or unconverged in {base_model.name}. "
               "Results remain NaN; see failed_cases.csv. Continuing.")
-    plot_sweep_with_gaps(sweep_df=sweep_df, output_dir=model_dir)
+    if settings.ENABLE_PLOTS and settings.RUN_AERODYNAMIC_PLOTS and settings.MAKE_AOA_SWEEP_PLOTS:
+        plot_sweep_with_gaps(sweep_df=sweep_df, output_dir=model_dir)
     return sweep_df
 
 
+@timed_stage("aoa_sweep")
 def run_aoa_sweep() -> pd.DataFrame:
     """Run the configured angle-of-attack sweep."""
+    if not settings.RUN_AOA_SWEEP:
+        print("[Skip] AoA sweep disabled in config.py.")
+        return pd.DataFrame()
     output_root = Path(OUTPUT_ROOT)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -380,6 +394,7 @@ def run_aoa_sweep() -> pd.DataFrame:
         frames.append(frame)
 
     combined = pd.concat(frames, ignore_index=True)
+    combined = report_aerodynamic_frame(combined, output_root / "aoa_sweep", "sweep_aerodynamic_change_metrics")
     combined_path = output_root / "aoa_sweep" / "selected_models_aoa_sweep_summary.csv"
     combined_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(combined_path, index=False)
@@ -390,50 +405,68 @@ def run_aoa_sweep() -> pd.DataFrame:
     return combined
 
 
+@timed_stage("pipeline")
 def run_all_workflows() -> dict[str, object]:
-    """Run the complete publication pipeline in its required order."""
-    from .plotting.aerodynamic import main as run_aerodynamic_plots
-    from .plotting.contours import main as run_contour_plots
-    from .plotting.geometry import main as run_geometry_plots
-    from .plotting.streamlines import main as run_streamline_plots
-
-    results: dict[str, object] = {}
-
-    print("=" * 80)
-    print("RUNNING COMPLETE POROUS-AIRFOIL PIPELINE")
-    print("=" * 80)
-
-    print("\n[1/5] Running angle-of-attack sweep")
-    results["aoa_sweep"] = run_aoa_sweep()
-
-    complete = bool(results["aoa_sweep"]["coupling_converged"].fillna(False).all())
-    stages = [
-        ("aero_plots", run_aerodynamic_plots),
-        ("geometry", run_geometry_plots),
-        ("contours", run_contour_plots),
-        ("streamlines", run_streamline_plots),
-    ]
+    """Run only enabled stages; disabled plotters are never imported or called."""
+    settings.validate_config()
+    output_root = Path(settings.OUTPUT_ROOT)
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = {}
     stage_status = []
-    for number, (name, operation) in enumerate(stages, start=2):
-        print(f"\n[{number}/5] Creating {name}")
-        if name == "aero_plots" and not complete:
-            message = "Using verified aoa_sweep_with_gaps.png plots; legacy bulk plotter skipped for incomplete data."
-            print(f"[Plot] {message}")
-            results[name] = {"status": "skipped", "message": message}
-        else:
+    stages = [
+        ("fixed_cases", settings.RUN_FIXED_CASES, run_fixed_cases, None),
+        ("aoa_sweep", settings.RUN_AOA_SWEEP, run_aoa_sweep, None),
+        ("aero_plots", settings.ENABLE_PLOTS and settings.RUN_AERODYNAMIC_PLOTS, None, "aerodynamic"),
+        ("geometry", settings.ENABLE_PLOTS and settings.RUN_GEOMETRY, None, "geometry"),
+        ("contours", settings.ENABLE_PLOTS and settings.RUN_CONTOURS, None, "contours"),
+        ("streamlines", settings.ENABLE_PLOTS and settings.RUN_STREAMLINES, None, "streamlines"),
+    ]
+    print("="*80)
+    print("POROUS-AIRFOIL PIPELINE -- stages controlled by config.py")
+    print("="*80)
+    try:
+        for number, (name, enabled, operation, module_name) in enumerate(stages, start=1):
+            if not enabled:
+                results[name] = {"status": "skipped", "message": "disabled in config.py"}
+                stage_status.append({"stage": name, "status": "skipped", "elapsed_seconds": 0.0,
+                                     "message": "disabled in config.py"})
+                print(f"[{number}/{len(stages)}] {name}: disabled")
+                continue
+            print(f"[{number}/{len(stages)}] Running {name}")
+            started = time.perf_counter()
+            status, message = "completed", ""
             try:
+                if module_name is not None:
+                    module = importlib.import_module(f".plotting.{module_name}", __package__)
+                    # Prefer this run's authoritative combined sweep table. An
+                    # explicit configured input path still takes precedence.
+                    if module_name == "aerodynamic" and settings.PLOT_AERO_INPUT_CSV_PATH is None:
+                        current_sweep = results.get("aoa_sweep")
+                        if isinstance(current_sweep, pd.DataFrame) and not current_sweep.empty:
+                            module.INPUT_CSV_PATH = output_root / "aoa_sweep" / "selected_models_aoa_sweep_summary.csv"
+                    operation = module.main
                 results[name] = operation()
-            except (ValueError, RuntimeError) as exc:
-                message = f"{type(exc).__name__}: {exc}"
-                print(f"[Stage failed] {name}: {message}. Continuing to the next stage.")
-                results[name] = {"status": "failed", "message": message}
-        result = results[name]
-        status = result.get("status", "completed") if isinstance(result, dict) else "completed"
-        message = result.get("message", "") if isinstance(result, dict) else ""
-        stage_status.append({"stage": name, "status": status, "message": message})
-    pd.DataFrame(stage_status).to_csv(Path(OUTPUT_ROOT) / "pipeline_stage_status.csv", index=False)
-
-    print("=" * 80)
-    print("PIPELINE FINISHED — inspect failure and stage-status CSVs")
-    print("=" * 80)
+                if isinstance(results[name], dict):
+                    status = results[name].get("status", status)
+                    message = results[name].get("message", message)
+                elif isinstance(results[name], pd.DataFrame) and "coupling_converged" in results[name]:
+                    failed = int((~results[name]["coupling_converged"].fillna(False).astype(bool)).sum())
+                    if failed:
+                        status, message = "completed_with_unconverged_cases", f"{failed} cases retained as NaN"
+            except Exception as exc:
+                status, message = "failed", f"{type(exc).__name__}: {exc}"
+                results[name] = {"status": status, "message": message}
+                print(f"[Stage failed] {name}: {message}")
+                if not settings.CONTINUE_AFTER_STAGE_ERROR:
+                    raise
+            finally:
+                stage_status.append({"stage": name, "status": status,
+                                     "elapsed_seconds": time.perf_counter()-started, "message": message})
+    finally:
+        pd.DataFrame(stage_status).to_csv(output_root / "pipeline_stage_status.csv", index=False)
+    results["status"] = (
+        "completed_with_failures" if any(s["status"] == "failed" for s in stage_status) else
+        "completed_with_unconverged_cases" if any(s["status"] == "completed_with_unconverged_cases" for s in stage_status) else
+        "completed")
+    print("[Pipeline] Finished; see pipeline_stage_status.csv and reports/run_timing.csv.")
     return results
