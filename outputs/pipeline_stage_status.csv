@@ -1,0 +1,7 @@
+stage,status,elapsed_seconds,message
+fixed_cases,skipped,0.0,disabled in config.py
+aoa_sweep,completed,8.731983689009212,
+aero_plots,completed,5.5782801259774715,
+geometry,completed,5.3306857999414206,
+contours,completed,214.3862047579605,
+streamlines,completed,201.31689550203737,
