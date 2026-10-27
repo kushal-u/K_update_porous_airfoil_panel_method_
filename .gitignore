@@ -1,3 +1,7 @@
-
 __pycache__/
 *.py[cod]
+
+# Ignore specific files in porous_airfoil
+porous_airfoil/config_1.py
+porous_airfoil/porous_1.py
+porous_airfoil/solver_1.py
